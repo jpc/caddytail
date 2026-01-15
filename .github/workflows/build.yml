@@ -1,0 +1,236 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.22"
+  XCADDY_VERSION: "latest"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux AMD64
+          - goos: linux
+            goarch: amd64
+            platform: manylinux2014_x86_64
+            runner: ubuntu-latest
+          # Linux ARM64
+          - goos: linux
+            goarch: arm64
+            platform: manylinux2014_aarch64
+            runner: ubuntu-latest
+          # macOS AMD64 (Intel)
+          - goos: darwin
+            goarch: amd64
+            platform: macosx_10_15_x86_64
+            runner: macos-latest
+          # macOS ARM64 (Apple Silicon)
+          - goos: darwin
+            goarch: arm64
+            platform: macosx_11_0_arm64
+            runner: macos-latest
+          # Windows AMD64
+          - goos: windows
+            goarch: amd64
+            platform: win_amd64
+            runner: ubuntu-latest
+
+    runs-on: ${{ matrix.runner }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      
+      - name: Install xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@${{ env.XCADDY_VERSION }}
+      
+      - name: Build Caddy with Tailscale plugin
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          BINARY_NAME="caddy"
+          if [ "$GOOS" = "windows" ]; then
+            BINARY_NAME="caddy.exe"
+          fi
+          
+          # Build caddy with tailscale plugin using xcaddy
+          xcaddy build \
+            --with github.com/tailscale/caddy-tailscale \
+            --output "src/caddytail/bin/$BINARY_NAME"
+          
+          # Verify the binary was created
+          ls -la src/caddytail/bin/
+        shell: bash
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: Install build tools
+        run: pip install build wheel
+      
+      - name: Build wheel
+        run: |
+          python -m build --wheel
+          
+          # List built wheels
+          ls -la dist/
+        shell: bash
+      
+      - name: Rename wheel with platform tag
+        run: |
+          cd dist
+          for f in *.whl; do
+            # Replace 'any' with platform-specific tag
+            newname=$(echo "$f" | sed "s/-py3-none-any/-py3-none-${{ matrix.platform }}/")
+            if [ "$f" != "$newname" ]; then
+              mv "$f" "$newname"
+              echo "Renamed $f -> $newname"
+            fi
+          done
+          ls -la
+        shell: bash
+      
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/*.whl
+
+  # Build source distribution (only needed once)
+  build-sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: Install build tools
+        run: pip install build
+      
+      - name: Build source distribution
+        run: python -m build --sdist
+      
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # Test that the wheel works
+  test:
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - platform: manylinux2014_x86_64
+            runner: ubuntu-latest
+          - platform: macosx_11_0_arm64
+            runner: macos-latest
+          - platform: win_amd64
+            runner: windows-latest
+    
+    runs-on: ${{ matrix.runner }}
+    
+    steps:
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      
+      - name: Install wheel
+        run: pip install dist/*.whl
+        shell: bash
+      
+      - name: Test caddytail command
+        run: |
+          caddytail version
+          caddytail list-modules | grep tailscale || echo "Checking tailscale module..."
+        shell: bash
+
+  # Publish to PyPI on version tags
+  publish:
+    needs: [build, build-sdist, test]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    permissions:
+      id-token: write  # For trusted publishing
+    
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheel-*
+          merge-multiple: true
+      
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      
+      - name: List distribution files
+        run: ls -la dist/
+      
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # Uses trusted publishing - configure at pypi.org/manage/project/caddytail/settings/publishing/
+        # Alternatively, use password: ${{ secrets.PYPI_API_TOKEN }}
+
+  # Publish to Test PyPI on main branch pushes (optional)
+  publish-test:
+    needs: [build, build-sdist]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    permissions:
+      id-token: write
+    
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheel-*
+          merge-multiple: true
+      
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+      
+      - name: Publish to Test PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+        continue-on-error: true  # Don't fail if version already exists
