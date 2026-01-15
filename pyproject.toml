@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "caddytail"
-version = "0.1.0"
+version = "0.2.0"
 description = "Caddy web server with Tailscale plugin, packaged for pip installation"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Jakub Piotr Cłapa", email = "jpc@loee.pl"}
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -33,9 +33,9 @@ requires-python = ">=3.8"
 keywords = ["caddy", "tailscale", "web-server", "reverse-proxy", "vpn"]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/caddytail"
-Repository = "https://github.com/yourusername/caddytail"
-Issues = "https://github.com/yourusername/caddytail/issues"
+Homepage = "https://github.com/jpc/caddytail"
+Repository = "https://github.com/jpc/caddytail"
+Issues = "https://github.com/jpc/caddytail/issues"
 
 [project.scripts]
 caddytail = "caddytail:main"
