@@ -40,6 +40,11 @@ Issues = "https://github.com/yourusername/caddytail/issues"
 [project.scripts]
 caddytail = "caddytail:main"
 
+[project.optional-dependencies]
+flask = ["flask>=2.0", "werkzeug>=2.0"]
+fastapi = ["fastapi>=0.68", "uvicorn>=0.15", "starlette>=0.14"]
+all = ["flask>=2.0", "werkzeug>=2.0", "fastapi>=0.68", "uvicorn>=0.15", "starlette>=0.14"]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

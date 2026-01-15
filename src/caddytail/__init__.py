@@ -17,18 +17,31 @@ def get_binary_path() -> str:
 def main() -> int:
     """Run the caddy binary with the provided arguments."""
     binary = get_binary_path()
-    
+
     if not os.path.exists(binary):
         print(f"Error: Caddy binary not found at {binary}", file=sys.stderr)
         print("This may indicate a packaging issue or unsupported platform.", file=sys.stderr)
         return 1
-    
+
     # Ensure the binary is executable on Unix-like systems
     if sys.platform != "win32":
         os.chmod(binary, 0o755)
-    
+
     # Execute caddy with all arguments passed through
     return subprocess.call([binary] + sys.argv[1:])
+
+from .api import CaddyTail, StaticPath, TailscaleUser, flask_user_required, fastapi_user_dependency
+
+__all__ = [
+    "__version__",
+    "get_binary_path",
+    "main",
+    "CaddyTail",
+    "StaticPath",
+    "TailscaleUser",
+    "flask_user_required",
+    "fastapi_user_dependency",
+]
 
 
 if __name__ == "__main__":
