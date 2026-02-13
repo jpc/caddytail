@@ -48,7 +48,9 @@ Usage with FastAPI:
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -91,6 +93,30 @@ class TailscaleUser:
         }
 
 
+def get_tailnet_from_tailscale() -> Optional[str]:
+    """
+    Get the tailnet name from the running Tailscale daemon.
+
+    Returns the tailnet name (without .ts.net suffix), or None if unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            status = json.loads(result.stdout)
+            # MagicDNSSuffix is like "your-tailnet.ts.net"
+            magic_dns = status.get("MagicDNSSuffix", "")
+            if magic_dns.endswith(".ts.net"):
+                return magic_dns[:-7]  # Remove ".ts.net"
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return None
+
+
 class CaddyTail:
     """
     Wrapper for Flask/FastAPI apps that sets up a Tailscale-authenticated Caddy reverse proxy.
@@ -100,7 +126,8 @@ class CaddyTail:
     Args:
         app: Flask or FastAPI application instance
         hostname: Tailscale hostname (e.g., "myapp" -> myapp.tailnet.ts.net)
-        tailnet: Tailscale tailnet name (without .ts.net suffix)
+        tailnet: Tailscale tailnet name (without .ts.net suffix). If not provided,
+            will be auto-detected from the running Tailscale daemon.
         caddy_path: Path to caddy binary (default: uses bundled binary)
         app_port: Port for the Python app to listen on (default: 10800)
         caddy_http_port: Port for Caddy's HTTP listener (default: 10102)
@@ -118,7 +145,7 @@ class CaddyTail:
         self,
         app: Union[FlaskApp, FastAPIApp],
         hostname: str,
-        tailnet: str,
+        tailnet: Optional[str] = None,
         caddy_path: Optional[Union[str, Path]] = None,
         app_port: int = 10800,
         caddy_http_port: int = 10102,
@@ -129,6 +156,18 @@ class CaddyTail:
     ):
         self.app = app
         self.hostname = hostname
+
+        # Auto-detect tailnet if not provided
+        if tailnet is None:
+            tailnet = get_tailnet_from_tailscale()
+            if tailnet is None:
+                raise ValueError(
+                    "Could not auto-detect tailnet. Either provide the 'tailnet' argument "
+                    "or ensure Tailscale is running and connected."
+                )
+        # Normalize: strip .ts.net suffix if provided
+        if tailnet.endswith(".ts.net"):
+            tailnet = tailnet[:-7]
         self.tailnet = tailnet
 
         # Use bundled binary by default
@@ -153,6 +192,8 @@ class CaddyTail:
                 self.static_paths = list(static_paths)
 
         self._caddy_process: Optional[subprocess.Popen] = None
+        self._watchdog_process: Optional[subprocess.Popen] = None
+        self._watchdog_pipe_write: Optional[int] = None  # Write end of pipe to watchdog
         self._framework = self._detect_framework()
 
         # Install middleware for user injection
@@ -311,6 +352,9 @@ class CaddyTail:
             ],
         })
 
+        # Full Tailscale FQDN for host matching and TLS
+        fqdn = f"{self.hostname}.{self.tailnet}.ts.net"
+
         # Build the full config
         config = {
             "admin": {
@@ -321,8 +365,15 @@ class CaddyTail:
                     "http_port": self.caddy_http_port,
                     "servers": {
                         "tailscale_srv": {
-                            "listen": [f"tailscale/{self.hostname}"],
+                            "listen": [f"tailscale/{self.hostname}:443"],
                             "routes": [
+                                {
+                                    "match": [
+                                        {
+                                            "host": [fqdn]
+                                        }
+                                    ],
+                                },
                                 {
                                     "handle": [
                                         {
@@ -341,8 +392,18 @@ class CaddyTail:
                         }
                     },
                 },
+                "tls": {
+                    "automation": {
+                        "policies": [
+                            {
+                                "subjects": [fqdn],
+                                "get_certificate": [{"via": "tailscale"}],
+                            }
+                        ],
+                    },
+                },
                 "tailscale": {
-                    "apps": {
+                    "nodes": {
                         self.hostname: {},
                     },
                 },
@@ -442,6 +503,71 @@ class CaddyTail:
                 return True
         return False
 
+    def _start_watchdog(self) -> None:
+        """
+        Start the watchdog process that monitors this process via a pipe.
+
+        When the main process dies (for any reason), the pipe closes and
+        the watchdog will shut down Caddy.
+        """
+        if self._caddy_process is None:
+            raise RuntimeError("Cannot start watchdog: Caddy is not running")
+
+        # Create a pipe: main process holds write end, watchdog holds read end
+        read_fd, write_fd = os.pipe()
+
+        # Get the path to the watchdog module
+        watchdog_module = Path(__file__).parent / "watchdog.py"
+
+        # Spawn the watchdog process
+        # Pass the read_fd as an inheritable file descriptor
+        caddy_pid = self._caddy_process.pid
+        cmd = [
+            sys.executable,
+            str(watchdog_module),
+            str(read_fd),
+            str(self.caddy_admin_port),
+            str(caddy_pid),
+        ]
+
+        # The watchdog needs to inherit the read_fd
+        self._watchdog_process = subprocess.Popen(
+            cmd,
+            pass_fds=(read_fd,),
+            stdout=sys.stderr,  # Watchdog output goes to stderr
+            stderr=sys.stderr,
+        )
+
+        # Close the read end in the parent process (we only need write end)
+        os.close(read_fd)
+
+        # Store the write end - keeping it open maintains the pipe
+        self._watchdog_pipe_write = write_fd
+
+        print(f"Watchdog started (PID {self._watchdog_process.pid})")
+
+    def _stop_watchdog(self) -> None:
+        """Stop the watchdog process."""
+        # Close the pipe write end - this signals the watchdog
+        if self._watchdog_pipe_write is not None:
+            try:
+                os.close(self._watchdog_pipe_write)
+            except OSError:
+                pass
+            self._watchdog_pipe_write = None
+
+        # Terminate the watchdog process if still running
+        if self._watchdog_process is not None:
+            try:
+                self._watchdog_process.terminate()
+                self._watchdog_process.wait(timeout=2)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    self._watchdog_process.kill()
+                except OSError:
+                    pass
+            self._watchdog_process = None
+
     def start_caddy(self) -> subprocess.Popen:
         """Start the Caddy process and load configuration via API."""
         if self._caddy_process is not None:
@@ -452,7 +578,6 @@ class CaddyTail:
 
         # Ensure the binary is executable on Unix-like systems
         if sys.platform != "win32":
-            import os
             os.chmod(self.caddy_path, 0o755)
 
         # Start Caddy with minimal config (just admin API)
@@ -486,10 +611,19 @@ class CaddyTail:
         # Load the full configuration
         self.load_config()
 
+        # Start the watchdog process to monitor us and clean up Caddy if we die
+        self._start_watchdog()
+
+        # Register atexit handler as a backup for normal exits
+        atexit.register(self._stop_watchdog)
+
         return self._caddy_process
 
     def stop_caddy(self) -> None:
-        """Stop the Caddy process."""
+        """Stop the Caddy process and watchdog."""
+        # Stop the watchdog first (so it doesn't try to shut down Caddy when we do)
+        self._stop_watchdog()
+
         if self._caddy_process is not None:
             # Try graceful shutdown via API first
             try:
@@ -568,6 +702,56 @@ class CaddyTail:
         app_thread.start()
 
         return caddy_proc, app_thread
+
+    # ------------------------------------------------------------------
+    # systemd service helpers
+    # ------------------------------------------------------------------
+
+    def install_service(
+        self,
+        script_path: Optional[str] = None,
+        service_name: Optional[str] = None,
+        environment: Optional[dict[str, str]] = None,
+        enable: bool = True,
+        start: bool = False,
+    ) -> Path:
+        """Install this app as a systemd user service."""
+        from .systemd import install_service
+        if script_path is None:
+            script_path = sys.argv[0]
+        return install_service(
+            script_path=script_path,
+            hostname=self.hostname,
+            service_name=service_name,
+            environment=environment,
+            enable=enable,
+            start=start,
+        )
+
+    def uninstall_service(self, service_name: Optional[str] = None) -> None:
+        """Uninstall this app's systemd user service."""
+        from .systemd import uninstall_service
+        uninstall_service(hostname=self.hostname, name=service_name)
+
+    def service_status(self, service_name: Optional[str] = None) -> dict:
+        """Return status information for this app's systemd user service."""
+        from .systemd import service_status
+        return service_status(hostname=self.hostname, name=service_name)
+
+    def restart_service(self, service_name: Optional[str] = None) -> None:
+        """Restart this app's systemd user service."""
+        from .systemd import restart_service
+        restart_service(hostname=self.hostname, name=service_name)
+
+    def service_logs(
+        self,
+        service_name: Optional[str] = None,
+        lines: int = 50,
+        follow: bool = False,
+    ) -> None:
+        """Show journal logs for this app's systemd user service."""
+        from .systemd import service_logs
+        service_logs(hostname=self.hostname, name=service_name, lines=lines, follow=follow)
 
 
 def flask_user_required(caddy: CaddyTail):

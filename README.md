@@ -21,10 +21,10 @@ from caddytail import CaddyTail, flask_user_required
 
 app = Flask(__name__)
 
+# tailnet is auto-detected from the running Tailscale daemon
 caddy = CaddyTail(
     app,
     hostname="myapp",           # Your Tailscale hostname
-    tailnet="your-tailnet",     # Your tailnet name (without .ts.net)
     static_paths={
         "/static/*": "./static",
     },
@@ -55,10 +55,10 @@ from caddytail import CaddyTail, fastapi_user_dependency
 
 app = FastAPI()
 
+# tailnet is auto-detected from the running Tailscale daemon
 caddy = CaddyTail(
     app,
     hostname="myapp",
-    tailnet="your-tailnet",
     static_paths={
         "/static/*": "./static",
     },
@@ -89,7 +89,7 @@ if __name__ == "__main__":
 |-----------|---------|-------------|
 | `app` | (required) | Flask or FastAPI application instance |
 | `hostname` | (required) | Tailscale hostname (e.g., "myapp" -> myapp.tailnet.ts.net) |
-| `tailnet` | (required) | Tailscale tailnet name (without .ts.net suffix) |
+| `tailnet` | auto-detected | Tailscale tailnet name (auto-detected from running Tailscale daemon) |
 | `caddy_path` | bundled binary | Path to caddy binary |
 | `app_port` | 10800 | Port for the Python app to listen on |
 | `caddy_http_port` | 10102 | Port for Caddy's HTTP listener |
@@ -118,7 +118,6 @@ Caddy can serve static files directly, bypassing your Python application for bet
 caddy = CaddyTail(
     app,
     hostname="myapp",
-    tailnet="your-tailnet",
     static_paths={
         "/static/*": "./static",
         "/assets/*": "./public/assets",

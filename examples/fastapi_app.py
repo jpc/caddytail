@@ -13,10 +13,10 @@ from caddytail import CaddyTail, fastapi_user_dependency
 app = FastAPI(title="Example FastAPI App with Tailscale Auth")
 
 # Configure CaddyTail wrapper
+# tailnet is auto-detected from the running Tailscale daemon
 caddy = CaddyTail(
     app,
     hostname="myapp",           # Your Tailscale hostname
-    tailnet="your-tailnet",     # Your tailnet name (without .ts.net)
     app_port=10800,
     static_paths={
         "/static/*": "./static",  # Serve static files from ./static at /static/*

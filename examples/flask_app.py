@@ -13,10 +13,11 @@ from caddytail import CaddyTail, flask_user_required
 app = Flask(__name__)
 
 # Configure CaddyTail wrapper
+# tailnet is auto-detected from the running Tailscale daemon
 caddy = CaddyTail(
     app,
     hostname="myapp",           # Your Tailscale hostname
-    tailnet="your-tailnet",     # Your tailnet name (without .ts.net)
+    tailnet="tail3eb4a",
     app_port=10800,
     static_paths={
         "/static/*": "./static",  # Serve static files from ./static at /static/*
@@ -31,7 +32,7 @@ def index():
     user = caddy.get_user()
     if not user:
         return "Not authenticated", 401
-    
+
     return f"""
     <html>
     <body>
