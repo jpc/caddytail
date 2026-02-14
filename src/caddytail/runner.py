@@ -116,7 +116,12 @@ def run(hostname: str, app_ref: str, *, debug: bool = False) -> None:
     try:
         if framework == "flask":
             app.run(host="127.0.0.1", port=app_port)
+        elif framework == "wsgi":
+            from wsgiref.simple_server import make_server
+            httpd = make_server("127.0.0.1", app_port, app)
+            httpd.serve_forever()
         else:
+            # fastapi and asgi both use uvicorn
             import uvicorn
             uvicorn.run(app, host="127.0.0.1", port=app_port)
     finally:

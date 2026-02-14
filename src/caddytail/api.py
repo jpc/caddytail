@@ -1,5 +1,7 @@
 """
-Tailscale + Caddy reverse proxy wrapper for Flask and FastAPI applications.
+Tailscale + Caddy reverse proxy wrapper for WSGI and ASGI applications.
+
+Supports Flask, FastAPI, Django, and any generic WSGI/ASGI callable.
 
 Standalone helpers:
     from caddytail import get_user, static, login_required
@@ -95,6 +97,29 @@ def _extract_user_from_headers(headers: dict[str, str]) -> Optional[TailscaleUse
     )
 
 
+def _extract_user_from_environ(environ: dict) -> Optional[TailscaleUser]:
+    """Extract Tailscale user from a WSGI environ dict.
+
+    WSGI converts headers like ``Tailscale-User-Name`` to
+    ``HTTP_TAILSCALE_USER_NAME``.
+    """
+    name = environ.get("HTTP_TAILSCALE_USER_NAME")
+    if not name:
+        return None
+
+    # Decode the name which may be latin1-encoded UTF-8
+    try:
+        name = name.encode('latin1').decode('utf8')
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+
+    return TailscaleUser(
+        name=name,
+        login=environ.get("HTTP_TAILSCALE_USER_LOGIN", ""),
+        profile_pic=environ.get("HTTP_TAILSCALE_USER_PROFILE_PIC", ""),
+    )
+
+
 def _find_free_port() -> int:
     """Find an available port on localhost."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -103,18 +128,25 @@ def _find_free_port() -> int:
 
 
 def _detect_framework(app: Any) -> str:
-    """Detect whether an app is Flask or FastAPI."""
+    """Detect whether an app is Flask, FastAPI, or a generic WSGI/ASGI callable."""
+    import inspect
+
     app_module = type(app).__module__
     if "flask" in app_module:
         return "flask"
     elif "fastapi" in app_module or "starlette" in app_module:
         return "fastapi"
+    elif hasattr(app, "wsgi_app"):
+        return "flask"
+    elif hasattr(app, "add_middleware"):
+        return "fastapi"
+    elif (inspect.iscoroutinefunction(app)
+          or inspect.iscoroutinefunction(getattr(app, "__call__", None))):
+        return "asgi"
+    elif callable(app):
+        return "wsgi"
     else:
-        if hasattr(app, "wsgi_app"):
-            return "flask"
-        elif hasattr(app, "add_middleware"):
-            return "fastapi"
-        raise ValueError(f"Unknown app framework: {app_module}")
+        raise ValueError(f"Not a callable app: {app_module}.{type(app).__name__}")
 
 
 def get_tailnet_from_tailscale() -> Optional[str]:
@@ -144,16 +176,20 @@ def get_tailnet_from_tailscale() -> Optional[str]:
 # Standalone helpers — the primary API for runner-first usage
 # ---------------------------------------------------------------------------
 
-def get_user(request: Optional[StarletteRequest] = None) -> Optional[TailscaleUser]:
+def get_user(request: Any = None) -> Optional[TailscaleUser]:
     """
     Get the authenticated Tailscale user.
 
     Flask: call with no arguments (uses flask.request automatically).
-    FastAPI: pass the Request object.
+    FastAPI / Starlette: pass the Request object.
+    WSGI: pass the environ dict.
 
     Returns a TailscaleUser or None if not authenticated.
     """
     if request is not None:
+        # WSGI environ dict
+        if isinstance(request, dict):
+            return _extract_user_from_environ(request)
         # FastAPI / Starlette path
         if hasattr(request, "state") and hasattr(request.state, "tailscale_user"):
             return request.state.tailscale_user
@@ -238,7 +274,7 @@ def static(app: Any, url_path: str, local_path: str) -> None:
     The runner reads these registrations when starting Caddy.
 
     Args:
-        app: Flask or FastAPI app instance
+        app: Flask, FastAPI, or any WSGI/ASGI app instance
         url_path: URL path pattern (e.g., "/assets/*")
         local_path: Local filesystem path (e.g., "./static")
     """
@@ -250,10 +286,14 @@ def static(app: Any, url_path: str, local_path: str) -> None:
             app.extensions = {}
         statics = app.extensions.setdefault("caddytail_static", [])
         statics.append(entry)
-    else:
+    elif framework == "fastapi":
         if not hasattr(app.state, "caddytail_static"):
             app.state.caddytail_static = []
         app.state.caddytail_static.append(entry)
+    else:
+        if not hasattr(app, "_caddytail_static"):
+            app._caddytail_static = []
+        app._caddytail_static.append(entry)
 
 
 def get_registered_statics(app: Any) -> list[StaticPath]:
@@ -261,8 +301,10 @@ def get_registered_statics(app: Any) -> list[StaticPath]:
     framework = _detect_framework(app)
     if framework == "flask":
         return list(getattr(app, "extensions", {}).get("caddytail_static", []))
-    else:
+    elif framework == "fastapi":
         return list(getattr(app.state, "caddytail_static", []))
+    else:
+        return list(getattr(app, "_caddytail_static", []))
 
 
 # ---------------------------------------------------------------------------
@@ -271,13 +313,15 @@ def get_registered_statics(app: Any) -> list[StaticPath]:
 
 class CaddyTail:
     """
-    Wrapper for Flask/FastAPI apps with a Tailscale-authenticated Caddy reverse proxy.
+    Wrapper for any WSGI/ASGI app with a Tailscale-authenticated Caddy reverse proxy.
+
+    Supports Flask, FastAPI, Django, and generic WSGI/ASGI callables.
 
     For most users, the CLI runner is simpler:
         caddytail run myapp app:app
 
     Args:
-        app: Flask or FastAPI application instance
+        app: Any WSGI or ASGI application (Flask, FastAPI, Django, bare callable, etc.)
         hostname: Tailscale hostname (e.g., "myapp")
         static: Extra static paths as a dict or list of StaticPath
         debug: Enable Caddy debug mode
@@ -287,7 +331,7 @@ class CaddyTail:
 
     def __init__(
         self,
-        app: Union[FlaskApp, FastAPIApp],
+        app: Any,
         hostname: str,
         *,
         static: Optional[Union[dict[str, str], list[StaticPath]]] = None,
@@ -353,8 +397,9 @@ class CaddyTail:
     def _setup_middleware(self) -> None:
         if self._framework == "flask":
             self._setup_flask_middleware()
-        else:
+        elif self._framework == "fastapi":
             self._setup_fastapi_middleware()
+        # No middleware needed for generic wsgi/asgi apps
 
     def _setup_flask_middleware(self) -> None:
         from werkzeug.middleware.proxy_fix import ProxyFix
@@ -638,7 +683,12 @@ class CaddyTail:
         try:
             if self._framework == "flask":
                 self.app.run(host=host, port=self.app_port, **kwargs)
+            elif self._framework == "wsgi":
+                from wsgiref.simple_server import make_server
+                httpd = make_server(host, self.app_port, self.app)
+                httpd.serve_forever()
             else:
+                # fastapi and asgi both use uvicorn
                 import uvicorn
                 uvicorn.run(self.app, host=host, port=self.app_port, **kwargs)
         finally:
@@ -656,7 +706,12 @@ class CaddyTail:
         def run_app():
             if self._framework == "flask":
                 self.app.run(host=host, port=self.app_port, threaded=True)
+            elif self._framework == "wsgi":
+                from wsgiref.simple_server import make_server
+                httpd = make_server(host, self.app_port, self.app)
+                httpd.serve_forever()
             else:
+                # fastapi and asgi both use uvicorn
                 import uvicorn
                 uvicorn.run(self.app, host=host, port=self.app_port)
 

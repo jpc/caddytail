@@ -1,11 +1,13 @@
 # caddytail
 
-Caddy web server with the [Tailscale plugin](https://github.com/tailscale/caddy-tailscale), packaged for pip installation. Run any Flask or FastAPI app on your tailnet with one command.
+Caddy web server with the [Tailscale plugin](https://github.com/tailscale/caddy-tailscale), packaged for pip installation. Run any Python web app on your tailnet with one command — Flask, FastAPI, Django, or any WSGI/ASGI callable.
 
 ## Installation
 
 ```bash
-pip install caddytail[flask]    # or caddytail[fastapi]
+pip install caddytail              # bare WSGI apps — no extra deps
+pip install caddytail[flask]       # Flask support
+pip install caddytail[fastapi]     # FastAPI / Starlette support
 ```
 
 ## Quick Start
@@ -23,6 +25,19 @@ app = Flask(__name__)
 def index():
     user = get_user()
     return f"Hello, {user.name}!"
+```
+
+Or use any WSGI callable — no framework required:
+
+```python
+# app.py
+from caddytail import get_user
+
+def app(environ, start_response):
+    user = get_user(environ)
+    body = f"Hello, {user.name}!" if user else "Not authenticated"
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    return [body.encode()]
 ```
 
 Run it on your tailnet:
@@ -64,7 +79,7 @@ The `<app_ref>` format is `module:variable` (like uvicorn), defaulting the varia
 
 ### Behavior
 
-- **`run`** — starts Caddy + your app in the foreground. Ctrl-C kills everything.
+- **`run`** — starts Caddy + your app in the foreground. Ctrl-C kills everything. The framework is auto-detected: Flask and FastAPI get framework-specific middleware; generic WSGI apps are served with `wsgiref`; generic ASGI apps are served with `uvicorn`.
 - **`install`** — writes a systemd unit file (ExecStart = `caddytail run ...`), enables, starts. If stdout is a tty, automatically tails logs. Ctrl-C stops tailing but leaves the service running.
 - **`uninstall`** — stops, disables, and removes the unit file.
 - **`caddy`** — passes all remaining args to the bundled Caddy binary.
@@ -78,11 +93,17 @@ Returns a `TailscaleUser` with `.name`, `.login`, `.profile_pic`:
 ```python
 from caddytail import get_user
 
-# Flask — no arguments needed
+# Flask — no arguments needed (uses flask.request automatically)
 user = get_user()
 
-# FastAPI — pass the Request object
+# FastAPI / Starlette — pass the Request object
 user = get_user(request)
+
+# WSGI — pass the environ dict
+user = get_user(environ)
+
+# Django — pass request.META
+user = get_user(request.META)
 
 if user:
     print(user.name)        # "John Doe"
@@ -136,7 +157,9 @@ caddy.run()
 
 All ports are auto-allocated. No conflicts when running multiple apps.
 
-## FastAPI Example
+## Framework Examples
+
+### FastAPI
 
 ```python
 from fastapi import FastAPI, Request, Depends
@@ -153,6 +176,42 @@ async def index(request: Request):
 async def protected(user=Depends(login_required)):
     return {"message": f"Hello, {user.name}!"}
 ```
+
+### Django
+
+```python
+# views.py
+from django.http import HttpResponse
+from caddytail import get_user
+
+def index(request):
+    user = get_user(request.META)
+    return HttpResponse(f"Hello, {user.name}!")
+```
+
+### Bare WSGI
+
+```python
+from caddytail import get_user
+
+def app(environ, start_response):
+    user = get_user(environ)
+    body = f"Hello, {user.name}!" if user else "Not authenticated"
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    return [body.encode()]
+```
+
+### ASGI
+
+```python
+from caddytail import get_user
+
+async def app(scope, receive, send):
+    # For ASGI apps, extract headers from the scope manually
+    ...
+```
+
+All examples are run the same way:
 
 ```bash
 caddytail run myapp myproject:app
