@@ -4,7 +4,14 @@ import os
 import subprocess
 import sys
 
-__version__ = "0.3.0"
+try:
+    from ._version import version as __version__
+except ImportError:
+    try:
+        from importlib.metadata import version as _get_version
+        __version__ = _get_version("caddytail")
+    except Exception:
+        __version__ = "0.0.0"
 
 _PYPI_URL = "https://pypi.org/pypi/caddytail/json"
 

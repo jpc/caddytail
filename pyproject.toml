@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0", "wheel", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "caddytail"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Caddy web server with Tailscale plugin, packaged for pip installation"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -44,6 +44,9 @@ caddytail = "caddytail:main"
 flask = ["flask>=2.0", "werkzeug>=2.0"]
 fastapi = ["fastapi>=0.68", "uvicorn>=0.15", "starlette>=0.14"]
 all = ["flask>=2.0", "werkzeug>=2.0", "fastapi>=0.68", "uvicorn>=0.15", "starlette>=0.14"]
+
+[tool.setuptools_scm]
+version_file = "src/caddytail/_version.py"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -26,6 +26,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# Generated version file (setuptools-scm)
+src/caddytail/_version.py
+
 # Built binaries (these are added during CI build)
 src/caddytail/bin/caddy
 src/caddytail/bin/caddy.exe
