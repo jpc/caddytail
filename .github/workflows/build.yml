@@ -171,8 +171,8 @@ jobs:
       
       - name: Test caddytail command
         run: |
-          caddytail version
-          caddytail list-modules | grep tailscale || echo "Checking tailscale module..."
+          caddytail caddy version
+          caddytail caddy list-modules | grep tailscale || echo "Checking tailscale module..."
         shell: bash
 
   # Publish to PyPI on version tags
