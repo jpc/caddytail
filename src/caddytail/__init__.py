@@ -4,9 +4,23 @@ import os
 import subprocess
 import sys
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 _PYPI_URL = "https://pypi.org/pypi/caddytail/json"
+
+USAGE = """\
+usage: caddytail <command> [args...]
+
+commands:
+  run <hostname> <app_ref>     Run app in foreground (Ctrl-C kills everything)
+  install <hostname> <app_ref> Install as systemd service + tail logs
+  status <hostname>            Show service status
+  logs <hostname> [-n N] [-f]  Show service logs
+  restart <hostname>           Restart service
+  uninstall <hostname>         Stop + remove service
+  list                         List installed services
+  caddy [args...]              Raw Caddy pass-through
+"""
 
 
 def _bundled_binary_path() -> str:
@@ -36,7 +50,6 @@ def fetch_binary() -> str:
     from io import BytesIO
     from pathlib import Path
 
-    # Detect platform
     system = platform.system().lower()
     machine = platform.machine().lower()
     if machine in ("x86_64", "amd64"):
@@ -59,7 +72,6 @@ def fetch_binary() -> str:
 
     print(f"Caddy binary not found — downloading from PyPI (platform: {tag})...")
 
-    # Query PyPI for the latest release
     try:
         with urllib.request.urlopen(_PYPI_URL) as resp:
             pypi_data = json.loads(resp.read())
@@ -68,7 +80,6 @@ def fetch_binary() -> str:
 
     version = pypi_data["info"]["version"]
 
-    # Find the wheel matching our platform
     matching = [
         u for u in pypi_data["urls"]
         if u["filename"].endswith(".whl") and tag in u["filename"]
@@ -90,7 +101,6 @@ def fetch_binary() -> str:
     except urllib.error.URLError as e:
         raise RuntimeError(f"Download failed: {e}") from e
 
-    # Extract caddy binary from the wheel (which is a zip)
     wheel_binary_path = f"caddytail/bin/{binary_name}"
     with zipfile.ZipFile(BytesIO(wheel_bytes)) as zf:
         if wheel_binary_path not in zf.namelist():
@@ -125,38 +135,234 @@ def get_binary_path() -> str:
         return fetch_binary()
     except RuntimeError as e:
         print(f"Auto-fetch failed: {e}", file=sys.stderr)
-        return bundled  # fall through so the caller gets the normal "not found" error
+        return bundled
 
 
-def main() -> int:
-    """Run the caddy binary with the provided arguments."""
-    # Intercept 'service' subcommand for systemd management
-    if len(sys.argv) > 1 and sys.argv[1] == "service":
-        from .systemd import cli_main
-        sys.argv = [sys.argv[0] + " service"] + sys.argv[2:]
-        return cli_main()
+# ---------------------------------------------------------------------------
+# CLI routing
+# ---------------------------------------------------------------------------
 
+def _parse_env_args(env_list: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for item in env_list:
+        if "=" not in item:
+            print(f"Error: invalid --env value (expected KEY=VALUE): {item}", file=sys.stderr)
+            sys.exit(1)
+        key, _, value = item.partition("=")
+        result[key] = value
+    return result
+
+
+def _cmd_run(args: list[str]) -> int:
+    """caddytail run <hostname> <app_ref> [--debug]"""
+    debug = "--debug" in args
+    positional = [a for a in args if not a.startswith("--")]
+
+    if len(positional) < 2:
+        print("usage: caddytail run <hostname> <app_ref> [--debug]", file=sys.stderr)
+        return 1
+
+    hostname, app_ref = positional[0], positional[1]
+
+    from .runner import run
+    run(hostname, app_ref, debug=debug)
+    return 0
+
+
+def _cmd_install(args: list[str]) -> int:
+    """caddytail install <hostname> <app_ref> [--no-start] [--env K=V]"""
+    no_start = "--no-start" in args
+
+    env_values: list[str] = []
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--env" and i + 1 < len(args):
+            env_values.append(args[i + 1])
+            i += 2
+        elif args[i].startswith("--"):
+            i += 1
+        else:
+            positional.append(args[i])
+            i += 1
+
+    if len(positional) < 2:
+        print("usage: caddytail install <hostname> <app_ref> [--no-start] [--env K=V]", file=sys.stderr)
+        return 1
+
+    hostname, app_ref = positional[0], positional[1]
+    environment = _parse_env_args(env_values) if env_values else None
+
+    from .systemd import install_service
+    try:
+        install_service(
+            hostname,
+            app_ref,
+            environment=environment,
+            start=not no_start,
+        )
+    except (RuntimeError, FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_uninstall(args: list[str]) -> int:
+    """caddytail uninstall <hostname>"""
+    if not args:
+        print("usage: caddytail uninstall <hostname>", file=sys.stderr)
+        return 1
+
+    from .systemd import uninstall_service
+    try:
+        uninstall_service(args[0])
+    except (RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_status(args: list[str]) -> int:
+    """caddytail status <hostname>"""
+    if not args:
+        print("usage: caddytail status <hostname>", file=sys.stderr)
+        return 1
+
+    from .systemd import service_status, _print_status
+    try:
+        info = service_status(args[0])
+        _print_status(info)
+    except (RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_logs(args: list[str]) -> int:
+    """caddytail logs <hostname> [-n LINES] [-f]"""
+    follow = "-f" in args or "--follow" in args
+    lines = 50
+
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] in ("-n", "--lines") and i + 1 < len(args):
+            try:
+                lines = int(args[i + 1])
+            except ValueError:
+                print(f"Error: invalid line count: {args[i + 1]}", file=sys.stderr)
+                return 1
+            i += 2
+        elif args[i] in ("-f", "--follow"):
+            i += 1
+        else:
+            positional.append(args[i])
+            i += 1
+
+    if not positional:
+        print("usage: caddytail logs <hostname> [-n LINES] [-f]", file=sys.stderr)
+        return 1
+
+    from .systemd import service_logs
+    try:
+        service_logs(positional[0], lines=lines, follow=follow)
+    except (RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_restart(args: list[str]) -> int:
+    """caddytail restart <hostname>"""
+    if not args:
+        print("usage: caddytail restart <hostname>", file=sys.stderr)
+        return 1
+
+    from .systemd import restart_service
+    try:
+        restart_service(args[0])
+    except (RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_list(args: list[str]) -> int:
+    """caddytail list"""
+    from .systemd import list_services, _print_status
+    try:
+        services = list_services()
+        if not services:
+            print("No caddytail services installed.")
+        else:
+            for info in services:
+                _print_status(info)
+                print()
+    except (RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _cmd_caddy(args: list[str]) -> int:
+    """caddytail caddy [args...] — raw Caddy pass-through"""
     binary = get_binary_path()
 
     if not os.path.exists(binary):
         print(f"Error: Caddy binary not found at {binary}", file=sys.stderr)
-        print("This may indicate a packaging issue or unsupported platform.", file=sys.stderr)
         return 1
 
-    # Ensure the binary is executable on Unix-like systems
     if sys.platform != "win32":
         os.chmod(binary, 0o755)
 
-    # Execute caddy with all arguments passed through
-    return subprocess.call([binary] + sys.argv[1:])
+    return subprocess.call([binary] + args)
+
+
+def main() -> int:
+    """CLI entry point."""
+    if len(sys.argv) < 2:
+        print(USAGE)
+        return 1
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    commands = {
+        "run": _cmd_run,
+        "install": _cmd_install,
+        "uninstall": _cmd_uninstall,
+        "status": _cmd_status,
+        "logs": _cmd_logs,
+        "restart": _cmd_restart,
+        "list": _cmd_list,
+        "caddy": _cmd_caddy,
+    }
+
+    handler = commands.get(cmd)
+    if handler is None:
+        print(f"Unknown command: {cmd}\n")
+        print(USAGE)
+        return 1
+
+    return handler(args)
+
+
+# ---------------------------------------------------------------------------
+# Public API re-exports
+# ---------------------------------------------------------------------------
 
 from .api import (
     CaddyTail,
     StaticPath,
     TailscaleUser,
+    get_user,
+    get_user_or_error,
+    login_required,
+    static,
+    get_tailnet_from_tailscale,
+    # Legacy
     flask_user_required,
     fastapi_user_dependency,
-    get_tailnet_from_tailscale,
 )
 from .systemd import (
     install_service,
@@ -167,21 +373,26 @@ from .systemd import (
     list_services,
 )
 
-# Backwards compatibility alias
-TailscaleCaddy = CaddyTail
-
 __all__ = [
     "__version__",
     "get_binary_path",
     "fetch_binary",
     "main",
+    # New standalone API
+    "get_user",
+    "get_user_or_error",
+    "login_required",
+    "static",
+    # Types
     "CaddyTail",
-    "TailscaleCaddy",  # Backwards compatibility
     "StaticPath",
     "TailscaleUser",
+    # Utilities
+    "get_tailnet_from_tailscale",
+    # Legacy
     "flask_user_required",
     "fastapi_user_dependency",
-    "get_tailnet_from_tailscale",
+    # systemd
     "install_service",
     "uninstall_service",
     "service_status",

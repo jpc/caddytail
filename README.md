@@ -1,193 +1,162 @@
 # caddytail
 
-Caddy web server with the [Tailscale plugin](https://github.com/tailscale/caddy-tailscale), packaged for pip installation. Includes a Python API for easy integration with Flask and FastAPI applications.
+Caddy web server with the [Tailscale plugin](https://github.com/tailscale/caddy-tailscale), packaged for pip installation. Run any Flask or FastAPI app on your tailnet with one command.
 
 ## Installation
 
 ```bash
-# Installation
-pip install caddytail
+pip install caddytail[flask]    # or caddytail[fastapi]
 ```
 
-## Python API
+## Quick Start
 
-caddytail provides a `CaddyTail` class that wraps your Flask or FastAPI application with a Caddy reverse proxy that handles Tailscale authentication automatically.
-
-### Flask Example
+Write a normal Flask app — no CaddyTail-specific setup needed:
 
 ```python
-from flask import Flask, g
-from caddytail import CaddyTail, flask_user_required
+# app.py
+from flask import Flask
+from caddytail import get_user
 
 app = Flask(__name__)
 
-# tailnet is auto-detected from the running Tailscale daemon
-caddy = CaddyTail(
-    app,
-    hostname="myapp",           # Your Tailscale hostname
-    static_paths={
-        "/static/*": "./static",
-    },
-)
-
 @app.get("/")
 def index():
-    user = caddy.get_user()
-    if not user:
-        return "Not authenticated", 401
-    return f"Hello, {user['name']}!"
-
-@app.get("/protected")
-@flask_user_required(caddy)
-def protected():
-    # User is automatically available in g.tailscale_user
-    return f"Hello, {g.tailscale_user['name']}!"
-
-if __name__ == "__main__":
-    caddy.run()  # Starts both Caddy and Flask
+    user = get_user()
+    return f"Hello, {user.name}!"
 ```
 
-### FastAPI Example
+Run it on your tailnet:
+
+```bash
+caddytail run myapp app:app
+```
+
+That's it. Your app is now available at `https://myapp.<tailnet>.ts.net` with Tailscale authentication.
+
+## CLI
+
+Hostname is always the first positional argument:
+
+```bash
+# Development — foreground, Ctrl-C kills everything
+caddytail run <hostname> <app_ref> [--debug]
+
+# Production — install as systemd service + tail logs
+caddytail install <hostname> <app_ref> [--no-start] [--env K=V]
+
+# Service management
+caddytail status <hostname>
+caddytail logs <hostname> [-n LINES] [-f]
+caddytail restart <hostname>
+caddytail uninstall <hostname>
+
+# List all installed services
+caddytail list
+
+# Raw Caddy pass-through
+caddytail caddy [args...]
+```
+
+The `<app_ref>` format is `module:variable` (like uvicorn), defaulting the variable to `app`:
+- `app:app` — import `app` from `app.py`
+- `myproject.main:application` — import `application` from `myproject/main.py`
+- `app` — shorthand for `app:app`
+
+### Behavior
+
+- **`run`** — starts Caddy + your app in the foreground. Ctrl-C kills everything.
+- **`install`** — writes a systemd unit file (ExecStart = `caddytail run ...`), enables, starts. If stdout is a tty, automatically tails logs. Ctrl-C stops tailing but leaves the service running.
+- **`uninstall`** — stops, disables, and removes the unit file.
+- **`caddy`** — passes all remaining args to the bundled Caddy binary.
+
+## Python API
+
+### `get_user()`
+
+Returns a `TailscaleUser` with `.name`, `.login`, `.profile_pic`:
+
+```python
+from caddytail import get_user
+
+# Flask — no arguments needed
+user = get_user()
+
+# FastAPI — pass the Request object
+user = get_user(request)
+
+if user:
+    print(user.name)        # "John Doe"
+    print(user.login)       # "john@example.com"
+    print(user.profile_pic) # "https://..."
+```
+
+### `login_required`
+
+Works as both a Flask decorator and a FastAPI `Depends()` target:
+
+```python
+from caddytail import login_required
+
+# Flask
+@app.get("/secret")
+@login_required
+def secret():
+    user = get_user()
+    return f"Hello, {user.name}!"
+
+# FastAPI
+@app.get("/secret")
+async def secret(user=Depends(login_required)):
+    return {"message": f"Hello, {user.name}!"}
+```
+
+### `static()`
+
+Register static file paths to be served directly by Caddy:
+
+```python
+from caddytail import static
+
+static(app, "/assets/*", "./static")
+static(app, "/uploads/*", "/var/www/uploads")
+```
+
+The runner picks these up automatically when starting Caddy.
+
+### `CaddyTail` class
+
+For programmatic use (most users should use the CLI runner instead):
+
+```python
+from caddytail import CaddyTail
+
+caddy = CaddyTail(app, "myapp", debug=True)
+caddy.run()
+```
+
+All ports are auto-allocated. No conflicts when running multiple apps.
+
+## FastAPI Example
 
 ```python
 from fastapi import FastAPI, Request, Depends
-from caddytail import CaddyTail, fastapi_user_dependency
+from caddytail import get_user, login_required
 
 app = FastAPI()
 
-# tailnet is auto-detected from the running Tailscale daemon
-caddy = CaddyTail(
-    app,
-    hostname="myapp",
-    static_paths={
-        "/static/*": "./static",
-    },
-)
-
-# Create a dependency for protected routes
-get_user = fastapi_user_dependency(caddy)
-
 @app.get("/")
 async def index(request: Request):
-    user = caddy.get_user(request)
-    if not user:
-        return {"error": "Not authenticated"}
-    return {"message": f"Hello, {user['name']}!"}
+    user = get_user(request)
+    return {"message": f"Hello, {user.name}!"}
 
 @app.get("/protected")
-async def protected(user: dict = Depends(get_user)):
-    # Automatically returns 401 if not authenticated
-    return {"message": f"Hello, {user['name']}!"}
-
-if __name__ == "__main__":
-    caddy.run()  # Starts both Caddy and FastAPI
+async def protected(user=Depends(login_required)):
+    return {"message": f"Hello, {user.name}!"}
 ```
-
-### CaddyTail Options
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `app` | (required) | Flask or FastAPI application instance |
-| `hostname` | (required) | Tailscale hostname (e.g., "myapp" -> myapp.tailnet.ts.net) |
-| `tailnet` | auto-detected | Tailscale tailnet name (auto-detected from running Tailscale daemon) |
-| `caddy_path` | bundled binary | Path to caddy binary |
-| `app_port` | 10800 | Port for the Python app to listen on |
-| `caddy_http_port` | 10102 | Port for Caddy's HTTP listener |
-| `caddy_admin_port` | 2019 | Port for Caddy's admin API |
-| `static_paths` | None | Dict mapping URL patterns to local paths |
-| `state_dir` | "./tailscale-state" | Directory for Tailscale state |
-| `debug` | False | Enable Caddy debug mode |
-
-### User Information
-
-The `get_user()` method returns a dict with Tailscale user information:
-
-```python
-{
-    "name": "John Doe",           # Display name
-    "login": "john@example.com",  # Login/email
-    "profile_pic": "https://..."  # Profile picture URL
-}
-```
-
-### Static File Serving
-
-Caddy can serve static files directly, bypassing your Python application for better performance:
-
-```python
-caddy = CaddyTail(
-    app,
-    hostname="myapp",
-    static_paths={
-        "/static/*": "./static",
-        "/assets/*": "./public/assets",
-        "/uploads/*": "/var/www/uploads",
-    },
-)
-
-# Add paths dynamically
-caddy.add_static_path("/media/*", "./media")
-
-# Remove paths
-caddy.remove_static_path("/uploads/*")
-```
-
-### Running in Background
-
-For advanced use cases, you can start Caddy and your app in background threads:
-
-```python
-caddy_proc, app_thread = caddy.run_async()
-
-# Do other things...
-
-# When done
-caddy.stop_caddy()
-```
-
-## CLI Usage
-
-Once installed, the `caddytail` command is also available on your PATH:
 
 ```bash
-# Show version
-caddytail version
-
-# List modules (should include tailscale)
-caddytail list-modules
-
-# Run with a Caddyfile
-caddytail run --config /path/to/Caddyfile
-
-# Start in the background
-caddytail start
-
-# Stop the background server
-caddytail stop
+caddytail run myapp myproject:app
 ```
-
-## Tailscale Integration
-
-This build of Caddy includes the Tailscale plugin, which allows you to:
-
-- Serve sites directly on your Tailscale network
-- Use Tailscale for automatic HTTPS certificates
-- Authenticate users via Tailscale identity
-
-### Manual Caddyfile Example
-
-```caddyfile
-{
-    tailscale
-}
-
-myapp.your-tailnet.ts.net {
-    tailscale_auth
-    reverse_proxy localhost:8000
-}
-```
-
-See the [caddy-tailscale documentation](https://github.com/tailscale/caddy-tailscale) for more details.
 
 ## Supported Platforms
 
@@ -201,11 +170,8 @@ Pre-built wheels are available for:
 
 ## Building from Source
 
-If you need to build for a platform not listed above:
-
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/caddytail
+git clone https://github.com/jpc/caddytail
 cd caddytail
 
 # Install Go and xcaddy

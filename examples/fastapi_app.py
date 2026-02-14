@@ -1,70 +1,41 @@
 """
 Example FastAPI application using caddytail.
 
-Run with: python fastapi_app.py
+Run with: caddytail run myapp examples.fastapi_app:app
 
 Requirements:
     pip install caddytail[fastapi]
 """
 
 from fastapi import FastAPI, Request, Depends
-from caddytail import CaddyTail, fastapi_user_dependency
+from caddytail import get_user, login_required
 
 app = FastAPI(title="Example FastAPI App with Tailscale Auth")
-
-# Configure CaddyTail wrapper
-# tailnet is auto-detected from the running Tailscale daemon
-caddy = CaddyTail(
-    app,
-    hostname="myapp",           # Your Tailscale hostname
-    app_port=10800,
-    static_paths={
-        "/static/*": "./static",  # Serve static files from ./static at /static/*
-    },
-    debug=True,
-)
-
-# Create a dependency for routes that need user auth
-get_user = fastapi_user_dependency(caddy)
 
 
 @app.get("/")
 async def index(request: Request):
     """Main page showing user info."""
-    user = caddy.get_user(request)
+    user = get_user(request)
     if not user:
         return {"error": "Not authenticated"}
-    
+
     return {
-        "message": f"Hello, {user['name']}!",
-        "user": user,
+        "message": f"Hello, {user.name}!",
+        "user": user.to_dict(),
     }
 
 
 @app.get("/api/me")
 async def api_me(request: Request):
     """API endpoint returning user info as JSON."""
-    user = caddy.get_user(request)
+    user = get_user(request)
     if not user:
         return {"error": "Not authenticated"}
-    return user
+    return user.to_dict()
 
 
 @app.get("/protected")
-async def protected(user: dict = Depends(get_user)):
-    """Example using dependency injection - automatically 401s if not authenticated."""
-    return {"message": f"Hello, {user['name']}! This is a protected route.", "user": user}
-
-
-@app.get("/via-state")
-async def via_state(request: Request):
-    """Access user via request.state (set by middleware)."""
-    user = request.state.tailscale_user
-    if not user:
-        return {"error": "Not authenticated"}
-    return {"message": f"Hello from state, {user.name}!", "login": user.login}
-
-
-if __name__ == "__main__":
-    # This starts both Caddy and FastAPI (via uvicorn)
-    caddy.run()
+async def protected(user=Depends(login_required)):
+    """Example using dependency injection — automatically 401s if not authenticated."""
+    return {"message": f"Hello, {user.name}! This is a protected route."}
