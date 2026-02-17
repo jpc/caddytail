@@ -496,6 +496,7 @@ class CaddyTail:
                     },
                 },
                 "tailscale": {
+                    "state_dir": str(self.state_dir),
                     "nodes": {self.hostname: {}},
                 },
             },
@@ -610,6 +611,26 @@ class CaddyTail:
                     pass
             self._watchdog_process = None
 
+    def _ensure_tailscale_auth(self) -> None:
+        """Run caddy tailscale-auth as a pre-flight check before loading config.
+
+        If the node is already authenticated, this returns immediately.
+        Otherwise it displays the auth URL and blocks until authenticated.
+        """
+        node_state_dir = self.state_dir / self.hostname
+        node_state_dir.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            str(self.caddy_path), "tailscale-auth",
+            "--hostname", self.hostname,
+            "--state-dir", str(node_state_dir),
+        ]
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            raise RuntimeError(
+                f"Tailscale authentication failed for '{self.hostname}' (exit code {rc})"
+            )
+
     def start_caddy(self) -> subprocess.Popen:
         if self._caddy_process is not None:
             raise RuntimeError("Caddy is already running")
@@ -641,6 +662,7 @@ class CaddyTail:
             self.stop_caddy()
             raise RuntimeError("Caddy admin API did not become available")
 
+        self._ensure_tailscale_auth()
         self.load_config()
         self._start_watchdog()
         atexit.register(self._stop_watchdog)

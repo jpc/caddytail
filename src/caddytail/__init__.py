@@ -26,6 +26,7 @@ commands:
   restart <hostname>           Restart service
   uninstall <hostname>         Stop + remove service
   list                         List installed services
+  login <hostname>              Authenticate Tailscale node
   caddy [args...]              Raw Caddy pass-through
 """
 
@@ -311,6 +312,50 @@ def _cmd_list(args: list[str]) -> int:
     return 0
 
 
+def _cmd_login(args: list[str]) -> int:
+    """caddytail login <hostname> [--state-dir <dir>] [--auth-key <key>]"""
+    from pathlib import Path
+
+    state_dir = "./tailscale-state"
+    auth_key = None
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--state-dir" and i + 1 < len(args):
+            state_dir = args[i + 1]
+            i += 2
+        elif args[i] == "--auth-key" and i + 1 < len(args):
+            auth_key = args[i + 1]
+            i += 2
+        elif args[i].startswith("--"):
+            i += 1
+        else:
+            positional.append(args[i])
+            i += 1
+
+    if not positional:
+        print("usage: caddytail login <hostname> [--state-dir <dir>] [--auth-key <key>]", file=sys.stderr)
+        return 1
+
+    hostname = positional[0]
+    node_state_path = Path(state_dir).resolve() / hostname
+    node_state_path.mkdir(parents=True, exist_ok=True)
+
+    binary = get_binary_path()
+    if not os.path.exists(binary):
+        print(f"Error: Caddy binary not found at {binary}", file=sys.stderr)
+        return 1
+
+    if sys.platform != "win32":
+        os.chmod(binary, 0o755)
+
+    cmd = [binary, "tailscale-auth", "--hostname", hostname, "--state-dir", str(node_state_path)]
+    if auth_key:
+        cmd.extend(["--auth-key", auth_key])
+
+    return subprocess.call(cmd)
+
+
 def _cmd_caddy(args: list[str]) -> int:
     """caddytail caddy [args...] — raw Caddy pass-through"""
     binary = get_binary_path()
@@ -342,6 +387,7 @@ def main() -> int:
         "logs": _cmd_logs,
         "restart": _cmd_restart,
         "list": _cmd_list,
+        "login": _cmd_login,
         "caddy": _cmd_caddy,
     }
 
