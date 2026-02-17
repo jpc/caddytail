@@ -71,7 +71,7 @@ jobs:
           
           # Build caddy with tailscale plugin using xcaddy
           xcaddy build \
-            --with github.com/tailscale/caddy-tailscale \
+            --with github.com/jpc/caddy-tailscale \
             --output "src/caddytail/bin/$BINARY_NAME"
           
           # Verify the binary was created
