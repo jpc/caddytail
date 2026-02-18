@@ -316,7 +316,7 @@ def _cmd_login(args: list[str]) -> int:
     """caddytail login <hostname> [--state-dir <dir>] [--auth-key <key>]"""
     from pathlib import Path
 
-    state_dir = "./tailscale-state"
+    state_dir = None
     auth_key = None
     positional: list[str] = []
     i = 0
@@ -338,8 +338,6 @@ def _cmd_login(args: list[str]) -> int:
         return 1
 
     hostname = positional[0]
-    node_state_path = Path(state_dir).resolve() / hostname
-    node_state_path.mkdir(parents=True, exist_ok=True)
 
     binary = get_binary_path()
     if not os.path.exists(binary):
@@ -349,7 +347,9 @@ def _cmd_login(args: list[str]) -> int:
     if sys.platform != "win32":
         os.chmod(binary, 0o755)
 
-    cmd = [binary, "tailscale-auth", "--hostname", hostname, "--state-dir", str(node_state_path)]
+    cmd = [binary, "tailscale-auth", "--hostname", hostname]
+    if state_dir:
+        cmd.extend(["--state-dir", str(Path(state_dir).resolve() / hostname)])
     if auth_key:
         cmd.extend(["--auth-key", auth_key])
 

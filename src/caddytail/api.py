@@ -341,7 +341,7 @@ class CaddyTail:
         app_port: Optional[int] = None,
         caddy_http_port: Optional[int] = None,
         caddy_admin_port: Optional[int] = None,
-        state_dir: Union[str, Path] = "./tailscale-state",
+        state_dir: Optional[Union[str, Path]] = None,
     ):
         self.app = app
         self.hostname = hostname
@@ -368,7 +368,7 @@ class CaddyTail:
         self.caddy_http_port = caddy_http_port or _find_free_port()
         self.caddy_admin_port = caddy_admin_port or _find_free_port()
 
-        self.state_dir = Path(state_dir).resolve()
+        self.state_dir = Path(state_dir).resolve() if state_dir else None
         self.debug = debug
 
         # Normalize static paths
@@ -460,6 +460,7 @@ class CaddyTail:
         config: dict[str, Any] = {
             "admin": {
                 "listen": f"localhost:{self.caddy_admin_port}",
+                "config": {"persist": False},
             },
             "apps": {
                 "http": {
@@ -496,7 +497,7 @@ class CaddyTail:
                     },
                 },
                 "tailscale": {
-                    "state_dir": str(self.state_dir),
+                    **({"state_dir": str(self.state_dir)} if self.state_dir else {}),
                     "nodes": {self.hostname: {}},
                 },
             },
@@ -616,15 +617,16 @@ class CaddyTail:
 
         If the node is already authenticated, this returns immediately.
         Otherwise it displays the auth URL and blocks until authenticated.
-        """
-        node_state_dir = self.state_dir / self.hostname
-        node_state_dir.mkdir(parents=True, exist_ok=True)
 
+        When no state_dir is set, both this and the caddy-tailscale plugin
+        default to ~/.config/tsnet-caddy-{hostname}.
+        """
         cmd = [
             str(self.caddy_path), "tailscale-auth",
             "--hostname", self.hostname,
-            "--state-dir", str(node_state_dir),
         ]
+        if self.state_dir:
+            cmd.extend(["--state-dir", str(self.state_dir / self.hostname)])
         rc = subprocess.call(cmd)
         if rc != 0:
             raise RuntimeError(
@@ -635,13 +637,14 @@ class CaddyTail:
         if self._caddy_process is not None:
             raise RuntimeError("Caddy is already running")
 
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-
         if sys.platform != "win32":
             os.chmod(self.caddy_path, 0o755)
 
         minimal_config = json.dumps({
-            "admin": {"listen": f"localhost:{self.caddy_admin_port}"}
+            "admin": {
+                "listen": f"localhost:{self.caddy_admin_port}",
+                "config": {"persist": False},
+            }
         })
 
         cmd = [str(self.caddy_path), "run", "--config", "-", "--adapter", ""]
