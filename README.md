@@ -5,9 +5,7 @@ Caddy web server with the [Tailscale plugin](https://github.com/tailscale/caddy-
 ## Installation
 
 ```bash
-pip install caddytail              # bare WSGI apps — no extra deps
-pip install caddytail[flask]       # Flask support
-pip install caddytail[fastapi]     # FastAPI / Starlette support
+pip install caddytail
 ```
 
 ## Quick Start
@@ -68,6 +66,9 @@ caddytail uninstall <hostname>
 # List all installed services
 caddytail list
 
+# Pre-provision Tailscale authentication
+caddytail login <hostname> [--auth-key <key>]
+
 # Raw Caddy pass-through
 caddytail caddy [args...]
 ```
@@ -82,6 +83,7 @@ The `<app_ref>` format is `module:variable` (like uvicorn), defaulting the varia
 - **`run`** — starts Caddy + your app in the foreground. Ctrl-C kills everything. The framework is auto-detected: Flask and FastAPI get framework-specific middleware; generic WSGI apps are served with `wsgiref`; generic ASGI apps are served with `uvicorn`.
 - **`install`** — writes a systemd unit file (ExecStart = `caddytail run ...`), enables, starts. If stdout is a tty, automatically tails logs. Ctrl-C stops tailing but leaves the service running.
 - **`uninstall`** — stops, disables, and removes the unit file.
+- **`login`** — authenticates a Tailscale node ahead of time. If already authenticated, returns immediately. Useful for headless provisioning with `--auth-key`.
 - **`caddy`** — passes all remaining args to the bundled Caddy binary.
 
 ## Python API
@@ -237,7 +239,7 @@ cd caddytail
 go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
 # Build caddy with the tailscale plugin
-xcaddy build --with github.com/tailscale/caddy-tailscale --output src/caddytail/bin/caddy
+xcaddy build --with github.com/tailscale/caddy-tailscale=github.com/jpc/caddy-tailscale@main --output src/caddytail/bin/caddy
 
 # Build the wheel
 pip install build
