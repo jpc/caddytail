@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +28,7 @@ UNIT_TEMPLATE = """\
 Description=CaddyTail: {hostname}
 After=network-online.target tailscaled.service
 Wants=network-online.target
+ConditionHost={machine_hostname}
 
 [Service]
 Type=simple
@@ -139,6 +141,7 @@ def install_service(
         app_ref=app_ref,
         working_directory=workdir,
         caddytail_path=caddytail_path,
+        machine_hostname=socket.gethostname(),
         environment_lines=env_lines.rstrip(),
     )
 

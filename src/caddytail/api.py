@@ -17,13 +17,13 @@ Programmatic usage:
 
 from __future__ import annotations
 
-import atexit
 import json
 import os
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -384,8 +384,6 @@ class CaddyTail:
         self.static_paths.extend(get_registered_statics(app))
 
         self._caddy_process: Optional[subprocess.Popen] = None
-        self._watchdog_process: Optional[subprocess.Popen] = None
-        self._watchdog_pipe_write: Optional[int] = None
         self._framework = _detect_framework(app)
 
         self._setup_middleware()
@@ -498,6 +496,7 @@ class CaddyTail:
                 },
                 "tailscale": {
                     **({"state_dir": str(self.state_dir)} if self.state_dir else {}),
+                    "watch_stdin": True,
                     "nodes": {self.hostname: {}},
                 },
             },
@@ -570,48 +569,6 @@ class CaddyTail:
                 return True
         return False
 
-    def _start_watchdog(self) -> None:
-        if self._caddy_process is None:
-            raise RuntimeError("Cannot start watchdog: Caddy is not running")
-
-        read_fd, write_fd = os.pipe()
-        watchdog_module = Path(__file__).parent / "watchdog.py"
-        caddy_pid = self._caddy_process.pid
-        cmd = [
-            sys.executable,
-            str(watchdog_module),
-            str(read_fd),
-            str(self.caddy_admin_port),
-            str(caddy_pid),
-        ]
-        self._watchdog_process = subprocess.Popen(
-            cmd,
-            pass_fds=(read_fd,),
-            stdout=sys.stderr,
-            stderr=sys.stderr,
-        )
-        os.close(read_fd)
-        self._watchdog_pipe_write = write_fd
-
-    def _stop_watchdog(self) -> None:
-        if self._watchdog_pipe_write is not None:
-            try:
-                os.close(self._watchdog_pipe_write)
-            except OSError:
-                pass
-            self._watchdog_pipe_write = None
-
-        if self._watchdog_process is not None:
-            try:
-                self._watchdog_process.terminate()
-                self._watchdog_process.wait(timeout=2)
-            except (subprocess.TimeoutExpired, OSError):
-                try:
-                    self._watchdog_process.kill()
-                except OSError:
-                    pass
-            self._watchdog_process = None
-
     def _ensure_tailscale_auth(self) -> None:
         """Run caddy tailscale-auth as a pre-flight check before loading config.
 
@@ -647,19 +604,29 @@ class CaddyTail:
             }
         })
 
-        cmd = [str(self.caddy_path), "run", "--config", "-", "--adapter", ""]
-
-        print(f"Starting Caddy with admin API on port {self.caddy_admin_port}...")
-
-        self._caddy_process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
+        # Write initial config to a temp file so that stdin stays open as a
+        # lifecycle pipe.  The caddy-tailscale plugin's watch_stdin option
+        # monitors stdin and triggers a graceful shutdown when it closes
+        # (i.e. when this parent process dies).
+        config_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", prefix="caddytail-", delete=False,
         )
+        try:
+            config_file.write(minimal_config)
+            config_file.close()
 
-        self._caddy_process.stdin.write(minimal_config.encode())
-        self._caddy_process.stdin.close()
+            cmd = [str(self.caddy_path), "run", "--config", config_file.name]
+
+            print(f"Starting Caddy with admin API on port {self.caddy_admin_port}...")
+
+            self._caddy_process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+            )
+        finally:
+            os.unlink(config_file.name)
 
         if not self._wait_for_admin_api():
             self.stop_caddy()
@@ -667,15 +634,18 @@ class CaddyTail:
 
         self._ensure_tailscale_auth()
         self.load_config()
-        self._start_watchdog()
-        atexit.register(self._stop_watchdog)
 
         return self._caddy_process
 
     def stop_caddy(self) -> None:
-        self._stop_watchdog()
-
         if self._caddy_process is not None:
+            # Close stdin to signal the caddy-tailscale watch_stdin goroutine.
+            if self._caddy_process.stdin:
+                try:
+                    self._caddy_process.stdin.close()
+                except OSError:
+                    pass
+
             try:
                 self._api_request("/stop", method="POST", timeout=2.0)
             except (urllib.error.URLError, RuntimeError, OSError):
