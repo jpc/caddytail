@@ -23,7 +23,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.request
@@ -496,7 +495,6 @@ class CaddyTail:
                 },
                 "tailscale": {
                     **({"state_dir": str(self.state_dir)} if self.state_dir else {}),
-                    "watch_stdin": True,
                     "nodes": {self.hostname: {}},
                 },
             },
@@ -597,43 +595,32 @@ class CaddyTail:
         if sys.platform != "win32":
             os.chmod(self.caddy_path, 0o755)
 
-        minimal_config = json.dumps({
-            "admin": {
-                "listen": f"localhost:{self.caddy_admin_port}",
-                "config": {"persist": False},
-            }
-        })
+        self._ensure_tailscale_auth()
 
-        # Write initial config to a temp file so that stdin stays open as a
-        # lifecycle pipe.  The caddy-tailscale plugin's watch_stdin option
-        # monitors stdin and triggers a graceful shutdown when it closes
-        # (i.e. when this parent process dies).
-        config_file = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", prefix="caddytail-", delete=False,
+        config = self.generate_config()
+
+        # The tailscale-run command reads one JSON config from stdin using a
+        # streaming decoder (no EOF required), starts Caddy, then watches
+        # stdin for parent death.
+        cmd = [str(self.caddy_path), "tailscale-run"]
+
+        print(f"Starting Caddy with admin API on port {self.caddy_admin_port}...")
+
+        self._caddy_process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
         )
-        try:
-            config_file.write(minimal_config)
-            config_file.close()
 
-            cmd = [str(self.caddy_path), "run", "--config", config_file.name]
-
-            print(f"Starting Caddy with admin API on port {self.caddy_admin_port}...")
-
-            self._caddy_process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=sys.stdout,
-                stderr=sys.stderr,
-            )
-        finally:
-            os.unlink(config_file.name)
+        self._caddy_process.stdin.write(json.dumps(config).encode())
+        self._caddy_process.stdin.flush()
 
         if not self._wait_for_admin_api():
             self.stop_caddy()
             raise RuntimeError("Caddy admin API did not become available")
 
-        self._ensure_tailscale_auth()
-        self.load_config()
+        print(f"Configuration loaded. Tailscale URL: {self.tailscale_url}")
 
         return self._caddy_process
 
