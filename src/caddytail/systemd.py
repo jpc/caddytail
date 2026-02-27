@@ -33,7 +33,7 @@ ConditionHost={machine_hostname}
 [Service]
 Type=simple
 WorkingDirectory={working_directory}
-ExecStart={caddytail_path} run {hostname} {app_ref}
+ExecStart={exec_start}
 Restart=on-failure
 RestartSec=5
 {environment_lines}
@@ -130,6 +130,7 @@ def install_service(
     svc = _default_service_name(hostname)
     workdir = str(Path(working_directory).resolve()) if working_directory else os.getcwd()
     caddytail_path = _find_caddytail_path()
+    exec_start = f"{caddytail_path} run {hostname} {app_ref}"
 
     env_lines = ""
     if environment:
@@ -138,9 +139,8 @@ def install_service(
 
     unit_content = UNIT_TEMPLATE.format(
         hostname=hostname,
-        app_ref=app_ref,
+        exec_start=exec_start,
         working_directory=workdir,
-        caddytail_path=caddytail_path,
         machine_hostname=socket.gethostname(),
         environment_lines=env_lines.rstrip(),
     )

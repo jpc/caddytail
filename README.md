@@ -52,7 +52,7 @@ Hostname is always the first positional argument:
 
 ```bash
 # Development — foreground, Ctrl-C kills everything
-caddytail run <hostname> <app_ref> [--debug]
+caddytail run <hostname> <app_ref> [--debug] [--env K=V]
 
 # Production — install as systemd service + tail logs
 caddytail install <hostname> <app_ref> [--no-start] [--env K=V]
@@ -77,6 +77,20 @@ The `<app_ref>` format is `module:variable` (like uvicorn), defaulting the varia
 - `app:app` — import `app` from `app.py`
 - `myproject.main:application` — import `application` from `myproject/main.py`
 - `app` — shorthand for `app:app`
+
+### Static File Server
+
+A built-in WSGI file server is included. No code needed — just point it at a directory:
+
+```bash
+# Foreground
+STATIC_PATH=./public caddytail run myfiles caddytail.fileserver:app
+
+# Install as a systemd service
+caddytail install myfiles caddytail.fileserver:app --env STATIC_PATH=/srv/files
+```
+
+`STATIC_PATH` defaults to `.` (the working directory). The server provides directory listings and serves `index.html` when present.
 
 ### Behavior
 

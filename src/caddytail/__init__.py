@@ -162,13 +162,29 @@ def _parse_env_args(env_list: list[str]) -> dict[str, str]:
 
 
 def _cmd_run(args: list[str]) -> int:
-    """caddytail run <hostname> <app_ref> [--debug]"""
+    """caddytail run <hostname> <app_ref> [--debug] [--env K=V]"""
     debug = "--debug" in args
-    positional = [a for a in args if not a.startswith("--")]
+
+    env_values: list[str] = []
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--env" and i + 1 < len(args):
+            env_values.append(args[i + 1])
+            i += 2
+        elif args[i].startswith("--"):
+            i += 1
+        else:
+            positional.append(args[i])
+            i += 1
 
     if len(positional) < 2:
-        print("usage: caddytail run <hostname> <app_ref> [--debug]", file=sys.stderr)
+        print("usage: caddytail run <hostname> <app_ref> [--debug] [--env K=V]", file=sys.stderr)
         return 1
+
+    if env_values:
+        for key, value in _parse_env_args(env_values).items():
+            os.environ[key] = value
 
     hostname, app_ref = positional[0], positional[1]
 
