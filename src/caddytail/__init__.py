@@ -217,6 +217,24 @@ def _cmd_install(args: list[str]) -> int:
     hostname, app_ref = positional[0], positional[1]
     environment = _parse_env_args(env_values) if env_values else None
 
+    # Pre-flight auth check — authenticate the Tailscale node before
+    # writing/starting the service, so interactive login can happen now.
+    binary = get_binary_path()
+    if not os.path.exists(binary):
+        print(f"Error: Caddy binary not found at {binary}", file=sys.stderr)
+        return 1
+    if sys.platform != "win32":
+        os.chmod(binary, 0o755)
+    rc = subprocess.call([binary, "tailscale-auth", "--hostname", hostname])
+    if rc != 0:
+        print(f"Error: Tailscale authentication failed for '{hostname}' (exit code {rc})", file=sys.stderr)
+        return 1
+
+    # Detect tailnet for URL display
+    from .api import get_tailnet_from_tailscale
+    tailnet = get_tailnet_from_tailscale()
+    url = f"https://{hostname}.{tailnet}.ts.net" if tailnet else None
+
     from .systemd import install_service
     try:
         install_service(
@@ -224,6 +242,7 @@ def _cmd_install(args: list[str]) -> int:
             app_ref,
             environment=environment,
             start=not no_start,
+            tailscale_url=url,
         )
     except (RuntimeError, FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

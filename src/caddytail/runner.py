@@ -90,7 +90,7 @@ def run(hostname: str, app_ref: str, *, debug: bool = False) -> None:
         debug=debug,
     )
 
-    print(f"Running {app_ref} on {caddy.tailscale_url}")
+    print(f"\n  {app_ref} -> {caddy.tailscale_url}\n")
 
     # CaddyTail.run() handles signals, starts Caddy, runs the app,
     # and blocks until shutdown.

@@ -107,6 +107,7 @@ def install_service(
     environment: Optional[dict[str, str]] = None,
     enable: bool = True,
     start: bool = True,
+    tailscale_url: Optional[str] = None,
 ) -> Path:
     """
     Install a caddytail app as a systemd user service.
@@ -170,6 +171,10 @@ def install_service(
         else:
             print(f"Warning: failed to start service: {result.stderr.strip()}")
 
+    if tailscale_url:
+        print()
+        print(f"  URL: {tailscale_url}")
+
     print()
     print("Hint: to keep the service running after you log out, run:")
     print(f"  loginctl enable-linger {os.environ.get('USER', '$USER')}")
@@ -179,7 +184,7 @@ def install_service(
         print()
         print("Tailing logs (Ctrl-C to detach, service keeps running)...")
         print()
-        _tail_logs_until_ctrl_c(svc)
+        _tail_logs_until_ctrl_c(svc, tailscale_url=tailscale_url)
 
     return unit_file
 
@@ -291,7 +296,7 @@ def list_services() -> list[dict[str, Any]]:
 # Log tailing with clean Ctrl-C detach
 # ---------------------------------------------------------------------------
 
-def _tail_logs_until_ctrl_c(service_name: str) -> None:
+def _tail_logs_until_ctrl_c(service_name: str, *, tailscale_url: Optional[str] = None) -> None:
     """Tail journalctl logs. Ctrl-C stops tailing but keeps the service running."""
     cmd = ["journalctl", "--user-unit", f"{service_name}.service", "-f", "-n", "20"]
 
@@ -310,8 +315,11 @@ def _tail_logs_until_ctrl_c(service_name: str) -> None:
     finally:
         signal.signal(signal.SIGINT, original_sigint)
 
+    hostname = service_name[len(SERVICE_PREFIX):]
     print("\nDetached from logs. Service is still running.")
-    print(f"  caddytail logs {service_name[len(SERVICE_PREFIX):]}")
+    if tailscale_url:
+        print(f"  URL:  {tailscale_url}")
+    print(f"  Logs: caddytail logs {hostname}")
 
 
 # ---------------------------------------------------------------------------
