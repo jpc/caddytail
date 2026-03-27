@@ -45,6 +45,7 @@ class StaticPath:
     url_path: str  # URL path pattern (e.g., "/static/*", "/assets/*")
     local_path: str  # Local filesystem path
     methods: list[str] = field(default_factory=lambda: ["GET"])
+    browse: bool = False  # Enable directory listings
 
 
 @dataclass
@@ -266,7 +267,7 @@ def login_required(fn: Optional[Callable] = None, *, request: Any = None) -> Any
     return wrapper
 
 
-def static(app: Any, url_path: str, local_path: str) -> None:
+def static(app: Any, url_path: str, local_path: str, *, browse: bool = False) -> None:
     """
     Register a static file path to be served by Caddy.
 
@@ -276,8 +277,9 @@ def static(app: Any, url_path: str, local_path: str) -> None:
         app: Flask, FastAPI, or any WSGI/ASGI app instance
         url_path: URL path pattern (e.g., "/assets/*")
         local_path: Local filesystem path (e.g., "./static")
+        browse: Enable directory listings
     """
-    entry = StaticPath(url_path=url_path, local_path=local_path)
+    entry = StaticPath(url_path=url_path, local_path=local_path, browse=browse)
 
     framework = _detect_framework(app)
     if framework == "flask":
@@ -428,12 +430,16 @@ class CaddyTail:
             if sp.methods:
                 match[0]["method"] = sp.methods
 
+            handler = {
+                "handler": "file_server",
+                "root": local_path,
+            }
+            if sp.browse:
+                handler["browse"] = {}
+
             routes.append({
                 "match": match,
-                "handle": [{
-                    "handler": "file_server",
-                    "root": local_path,
-                }],
+                "handle": [handler],
             })
 
         routes.append({
@@ -465,6 +471,7 @@ class CaddyTail:
                     "servers": {
                         "tailscale_srv": {
                             "listen": [f"tailscale/{self.hostname}:443"],
+                            "protocols": ["h1", "h2", "h3"],
                             "routes": [
                                 {
                                     "match": [{"host": [fqdn]}],
@@ -474,6 +481,14 @@ class CaddyTail:
                                         {
                                             "handler": "authentication",
                                             "providers": {"tailscale": {}},
+                                        },
+                                        {
+                                            "handler": "encode",
+                                            "encodings": {
+                                                "zstd": {},
+                                                "gzip": {},
+                                            },
+                                            "prefer": ["zstd", "gzip"],
                                         },
                                         {
                                             "handler": "subroute",
