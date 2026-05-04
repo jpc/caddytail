@@ -44,7 +44,7 @@ class StaticPath:
     """Configuration for a static file path served by Caddy."""
     url_path: str  # URL path pattern (e.g., "/static/*", "/assets/*")
     local_path: str  # Local filesystem path
-    methods: list[str] = field(default_factory=lambda: ["GET"])
+    methods: list[str] = field(default_factory=lambda: ["GET", "HEAD"])
     browse: bool = False  # Enable directory listings
 
 
@@ -568,7 +568,7 @@ class CaddyTail:
         self.static_paths.append(StaticPath(
             url_path=url_path,
             local_path=local_path,
-            methods=methods or ["GET"],
+            methods=methods or ["GET", "HEAD"],
         ))
         if self._caddy_process is not None:
             self.load_config()
