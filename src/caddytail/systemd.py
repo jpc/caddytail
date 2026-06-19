@@ -108,6 +108,7 @@ def install_service(
     enable: bool = True,
     start: bool = True,
     tailscale_url: Optional[str] = None,
+    extra_args: Optional[list[str]] = None,
 ) -> Path:
     """
     Install a caddytail app as a systemd user service.
@@ -132,6 +133,8 @@ def install_service(
     workdir = str(Path(working_directory).resolve()) if working_directory else os.getcwd()
     caddytail_path = _find_caddytail_path()
     exec_start = f"{caddytail_path} run {hostname} {app_ref}"
+    if extra_args:
+        exec_start += " " + " ".join(extra_args)
 
     env_lines = ""
     if environment:

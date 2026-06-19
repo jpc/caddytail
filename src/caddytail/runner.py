@@ -13,7 +13,9 @@ from typing import Any
 
 from .api import (
     CaddyTail,
+    _exposures_from_flags,
     _find_free_port,
+    get_registered_exposures,
     get_registered_statics,
     get_tailnet_from_tailscale,
 )
@@ -60,8 +62,20 @@ def _import_app(app_ref: str) -> Any:
     return app
 
 
-def run(hostname: str, app_ref: str, *, debug: bool = False) -> None:
-    """Run an app with Caddy in the foreground. Ctrl-C kills everything."""
+def run(
+    hostname: str,
+    app_ref: str,
+    *,
+    debug: bool = False,
+    funnel: bool = False,
+    tailnet_listener: bool = False,
+) -> None:
+    """Run an app with Caddy in the foreground. Ctrl-C kills everything.
+
+    ``funnel`` / ``tailnet_listener`` mirror the ``--funnel`` / ``--tailnet``
+    CLI flags. When neither is given, expose() registrations on the app are
+    used, falling back to a tailnet-only listener.
+    """
     app = _import_app(app_ref)
 
     # Read static() registrations from the app
@@ -77,6 +91,12 @@ def run(hostname: str, app_ref: str, *, debug: bool = False) -> None:
         )
         sys.exit(1)
 
+    # Flags win; otherwise fall back to expose() registrations, then default.
+    if funnel or tailnet_listener:
+        exposures = _exposures_from_flags(funnel, tailnet_listener)
+    else:
+        exposures = get_registered_exposures(app) or None
+
     # CaddyTail sets up middleware, config, and manages Caddy lifecycle
     caddy = CaddyTail(
         app,
@@ -87,10 +107,12 @@ def run(hostname: str, app_ref: str, *, debug: bool = False) -> None:
         caddy_http_port=_find_free_port(),
         caddy_admin_port=_find_free_port(),
         static=static_paths or None,
+        exposures=exposures,
         debug=debug,
     )
 
-    print(f"\n  {app_ref} -> {caddy.tailscale_url}\n")
+    urls = "\n  ".join(f"{app_ref} -> {url}" for _, url in caddy.urls)
+    print(f"\n  {urls}\n")
 
     # CaddyTail.run() handles signals, starts Caddy, runs the app,
     # and blocks until shutdown.
