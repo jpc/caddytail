@@ -151,6 +151,8 @@ class TailscaleUser:
 HEADER_USER_NAME = "Tailscale-User-Name"
 HEADER_USER_LOGIN = "Tailscale-User-Login"
 HEADER_USER_PROFILE_PIC = "Tailscale-User-Profile-Pic"
+HEADER_NODE = "Tailscale-Node"           # tagged-node hostname (empty for user nodes)
+HEADER_TAGS = "Tailscale-Tags"           # comma-separated tags (empty for user nodes)
 
 
 # ---------------------------------------------------------------------------
@@ -618,11 +620,14 @@ class CaddyTail:
                     HEADER_USER_LOGIN: ["{http.auth.user.tailscale_login}"],
                     HEADER_USER_NAME: ["{http.auth.user.tailscale_name}"],
                     HEADER_USER_PROFILE_PIC: ["{http.auth.user.tailscale_profile_picture}"],
+                    HEADER_NODE: ["{http.auth.user.tailscale_node}"],
+                    HEADER_TAGS: ["{http.auth.user.tailscale_tags}"],
                 }
             }
         else:
             request_headers = {
-                "delete": [HEADER_USER_NAME, HEADER_USER_LOGIN, HEADER_USER_PROFILE_PIC],
+                "delete": [HEADER_USER_NAME, HEADER_USER_LOGIN,
+                           HEADER_USER_PROFILE_PIC, HEADER_NODE, HEADER_TAGS],
             }
 
         routes.append({
