@@ -52,10 +52,10 @@ Hostname is always the first positional argument:
 
 ```bash
 # Development — foreground, Ctrl-C kills everything
-caddytail run <hostname> <app_ref> [--funnel] [--tailnet] [--debug] [--env K=V]
+caddytail run <hostname> <app_ref> [--funnel] [--tailnet] [--server dev|gunicorn] [--workers N] [--threads N] [--debug] [--env K=V]
 
 # Production — install as systemd service + tail logs
-caddytail install <hostname> <app_ref> [--funnel] [--tailnet] [--no-start] [--env K=V]
+caddytail install <hostname> <app_ref> [--funnel] [--tailnet] [--server dev|gunicorn] [--workers N] [--threads N] [--no-start] [--env K=V]
 
 # Service management
 caddytail status <hostname>
@@ -123,6 +123,36 @@ ports **443, 8443, 10000**.
 
 [Tailscale Funnel]: https://tailscale.com/kb/1223/funnel
 [enabled in your tailnet ACL]: https://tailscale.com/kb/1223/funnel#allow-funnel-access-in-acl
+
+### Production app server (gunicorn)
+
+By default caddytail runs your app on its framework's built-in **development**
+server (Werkzeug for Flask, `wsgiref`, or `uvicorn`). That's fine for the
+tailnet, but not for public funnel traffic. Add `--server gunicorn` to run a
+hardened [gunicorn] server instead:
+
+```bash
+pip install 'caddytail[gunicorn]'
+caddytail run hsv survey.server.app:app --funnel --server gunicorn
+```
+
+caddytail spawns and supervises gunicorn as a subprocess bound to the internal
+port, alongside Caddy. Defaults:
+
+- **WSGI** (Flask etc.) → `gunicorn -w 1 -k gthread --threads 8`. This mirrors
+  the threaded dev server — a single process with N threads — so apps with
+  in-memory state keep working. Tune with `--workers N` / `--threads N`.
+- **ASGI** (FastAPI etc.) → `gunicorn -k uvicorn.workers.UvicornWorker -w N`.
+
+> Passing `--workers N > 1` runs multiple **processes**. Only do that if your
+> app is stateless or uses shared storage (redis/db) — otherwise per-process
+> in-memory state will diverge.
+
+`ProxyFix` / Tailscale middleware are re-applied inside the gunicorn workers
+(via the `caddytail.wsgi` entrypoint), so `url_for(_external=True)`, redirects,
+and `get_user()` behave exactly as under the dev server.
+
+[gunicorn]: https://gunicorn.org/
 
 ### Behavior
 

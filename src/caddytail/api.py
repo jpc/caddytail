@@ -438,6 +438,40 @@ def get_registered_exposures(app: Any) -> list[Exposure]:
         return list(getattr(app, "_caddytail_exposures", []))
 
 
+def apply_middleware(app: Any, framework: Optional[str] = None) -> Any:
+    """Apply the framework-appropriate caddytail middleware and return the app.
+
+    - Flask: ProxyFix (trust X-Forwarded-Host so redirects/url_for use the
+      real tailnet/funnel hostname).
+    - FastAPI/Starlette: middleware that stashes the Tailscale user on
+      request.state.
+
+    Used both by the in-process dev server and by the caddytail.wsgi shim,
+    so an external server (gunicorn) gets the same behaviour after it
+    re-imports the app in its worker processes.
+    """
+    if framework is None:
+        framework = _detect_framework(app)
+
+    if framework == "flask":
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_host=1)
+    elif framework == "fastapi":
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.requests import Request
+
+        class TailscaleUserMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Request, call_next):
+                request.state.tailscale_user = _extract_user_from_headers(
+                    dict(request.headers)
+                )
+                return await call_next(request)
+
+        app.add_middleware(TailscaleUserMiddleware)
+    # Generic WSGI/ASGI callables need no middleware.
+    return app
+
+
 # ---------------------------------------------------------------------------
 # CaddyTail class — for programmatic use
 # ---------------------------------------------------------------------------
@@ -470,6 +504,10 @@ class CaddyTail:
         funnel: bool = False,
         tailnet_listener: bool = False,
         exposures: Optional[list[Exposure]] = None,
+        server: str = "dev",
+        workers: int = 1,
+        threads: int = 8,
+        app_ref: Optional[str] = None,
         tailnet: Optional[str] = None,
         caddy_path: Optional[Union[str, Path]] = None,
         app_port: Optional[int] = None,
@@ -479,6 +517,17 @@ class CaddyTail:
     ):
         self.app = app
         self.hostname = hostname
+
+        # App server: "dev" runs the app in-process (Werkzeug/wsgiref/uvicorn);
+        # "gunicorn" spawns a hardened gunicorn subprocess bound to app_port.
+        if server not in ("dev", "gunicorn"):
+            raise ValueError(f"invalid server {server!r}; expected 'dev' or 'gunicorn'")
+        self.server = server
+        self.workers = workers
+        self.threads = threads
+        # Import string (module:variable) needed to launch an external server,
+        # which re-imports the app in its own worker processes.
+        self.app_ref = app_ref
 
         # Resolve which listeners to create. Priority:
         #   explicit exposures= > funnel/tailnet_listener flags >
@@ -533,36 +582,21 @@ class CaddyTail:
         self.static_paths.extend(get_registered_statics(app))
 
         self._caddy_process: Optional[subprocess.Popen] = None
+        self._app_process: Optional[subprocess.Popen] = None
         self._framework = _detect_framework(app)
 
-        self._setup_middleware()
+        # For the dev server we mutate the in-process app object. For an
+        # external server the worker processes re-import the app, so the
+        # middleware is re-applied there by the caddytail.wsgi shim instead.
+        if self.server == "dev":
+            self._setup_middleware()
 
     @property
     def admin_url(self) -> str:
         return f"http://localhost:{self.caddy_admin_port}"
 
     def _setup_middleware(self) -> None:
-        if self._framework == "flask":
-            self._setup_flask_middleware()
-        elif self._framework == "fastapi":
-            self._setup_fastapi_middleware()
-        # No middleware needed for generic wsgi/asgi apps
-
-    def _setup_flask_middleware(self) -> None:
-        from werkzeug.middleware.proxy_fix import ProxyFix
-        self.app.wsgi_app = ProxyFix(self.app.wsgi_app, x_host=1)
-
-    def _setup_fastapi_middleware(self) -> None:
-        from starlette.middleware.base import BaseHTTPMiddleware
-        from starlette.requests import Request
-
-        class TailscaleUserMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request: Request, call_next):
-                user = _extract_user_from_headers(dict(request.headers))
-                request.state.tailscale_user = user
-                return await call_next(request)
-
-        self.app.add_middleware(TailscaleUserMiddleware)
+        apply_middleware(self.app, self._framework)
 
     def _exposure_url(self, exposure: Exposure) -> str:
         host = exposure.hostname or self.hostname
@@ -877,6 +911,69 @@ class CaddyTail:
                 self._caddy_process.kill()
             self._caddy_process = None
 
+    def _gunicorn_command(self) -> list[str]:
+        """Build the gunicorn command line for the current framework.
+
+        WSGI apps use the ``gthread`` worker (one process, N threads) — a
+        drop-in for the threaded dev server that keeps in-memory state
+        consistent. ASGI apps use the uvicorn worker class instead.
+        """
+        if not self.app_ref:
+            raise RuntimeError(
+                "server='gunicorn' requires app_ref (the 'module:variable' "
+                "import string); it is set automatically by `caddytail run`"
+            )
+
+        import importlib.util
+        if importlib.util.find_spec("gunicorn") is None:
+            raise RuntimeError(
+                "gunicorn is not installed. Install it with: "
+                "pip install 'caddytail[gunicorn]'"
+            )
+
+        cmd = [
+            sys.executable, "-m", "gunicorn",
+            "--bind", f"127.0.0.1:{self.app_port}",
+            "--workers", str(self.workers),
+        ]
+        if self._framework in ("fastapi", "asgi"):
+            if importlib.util.find_spec("uvicorn") is None:
+                raise RuntimeError(
+                    "serving an ASGI app under gunicorn needs uvicorn. Install "
+                    "it with: pip install 'caddytail[gunicorn]'"
+                )
+            cmd += ["--worker-class", "uvicorn.workers.UvicornWorker"]
+        else:
+            cmd += ["--worker-class", "gthread", "--threads", str(self.threads)]
+        cmd.append("caddytail.wsgi:application")
+        return cmd
+
+    def _start_app_server(self) -> subprocess.Popen:
+        """Spawn gunicorn as a managed subprocess bound to app_port."""
+        if self._app_process is not None:
+            raise RuntimeError("App server is already running")
+
+        cmd = self._gunicorn_command()
+        env = os.environ.copy()
+        # The caddytail.wsgi shim reads this to import + wrap the real app.
+        env["CADDYTAIL_APP"] = self.app_ref
+
+        print(f"Starting app server: {' '.join(cmd)}")
+        self._app_process = subprocess.Popen(
+            cmd, env=env, stdout=sys.stdout, stderr=sys.stderr,
+        )
+        return self._app_process
+
+    def _stop_app_server(self) -> None:
+        if self._app_process is not None:
+            # SIGTERM triggers gunicorn's graceful worker shutdown.
+            self._app_process.terminate()
+            try:
+                self._app_process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                self._app_process.kill()
+            self._app_process = None
+
     def run(
         self,
         host: str = "127.0.0.1",
@@ -885,6 +982,7 @@ class CaddyTail:
     ) -> None:
         def signal_handler(signum, frame):
             print("\nShutting down...")
+            self._stop_app_server()
             self.stop_caddy()
             sys.exit(0)
 
@@ -895,7 +993,10 @@ class CaddyTail:
             self.start_caddy()
 
         try:
-            if self._framework == "flask":
+            if self.server == "gunicorn":
+                proc = self._start_app_server()
+                proc.wait()
+            elif self._framework == "flask":
                 self.app.run(host=host, port=self.app_port, **kwargs)
             elif self._framework == "wsgi":
                 from wsgiref.simple_server import make_server
@@ -906,6 +1007,7 @@ class CaddyTail:
                 import uvicorn
                 uvicorn.run(self.app, host=host, port=self.app_port, **kwargs)
         finally:
+            self._stop_app_server()
             self.stop_caddy()
 
     def run_async(

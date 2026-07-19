@@ -32,6 +32,11 @@ classifiers = [
 requires-python = ">=3.8"
 keywords = ["caddy", "tailscale", "web-server", "reverse-proxy", "vpn"]
 
+[project.optional-dependencies]
+# Production app server for `caddytail run ... --server gunicorn`.
+# uvicorn provides the ASGI worker class for FastAPI/Starlette apps.
+gunicorn = ["gunicorn>=21", "uvicorn>=0.20"]
+
 [project.urls]
 Homepage = "https://github.com/jpc/caddytail"
 Repository = "https://github.com/jpc/caddytail"
