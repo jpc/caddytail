@@ -48,6 +48,87 @@ class StaticPath:
     browse: bool = False  # Enable directory listings
 
 
+# Ports Tailscale Funnel accepts. Mirrors the check in the caddy-tailscale
+# plugin (module.go) so we fail early with a clear error instead of at launch.
+FUNNEL_PORTS = (443, 8443, 10000)
+
+_NETWORK_BY_MODE = {
+    "tailnet": "tailscale",
+    "funnel": "tailscale+funnel",
+    "funnel-only": "tailscale+funnel-only",
+}
+
+
+@dataclass
+class Exposure:
+    """A single Caddy listener exposing the app on the tailnet and/or publicly.
+
+    ``mode``:
+        - ``"tailnet"``      private to the tailnet, Tailscale-authenticated,
+                             injects identity headers (the default).
+        - ``"funnel"``       public internet **and** tailnet, unauthenticated.
+        - ``"funnel-only"``  public internet only (rejects in-tailnet conns),
+                             unauthenticated.
+
+    Funnel traffic carries no Tailscale identity, so funnel exposures cannot be
+    authenticated. To serve the public *and* have an authenticated surface, use
+    two exposures (e.g. a ``funnel-only`` and a ``tailnet`` one) — see
+    ``CaddyTail(..., funnel=True, tailnet=True)``.
+    """
+    mode: str = "tailnet"
+    port: int = 443
+    hostname: Optional[str] = None  # defaults to the node hostname
+    auth: Optional[bool] = None  # None => True for tailnet, False for funnel
+
+    def __post_init__(self) -> None:
+        if self.mode not in _NETWORK_BY_MODE:
+            raise ValueError(
+                f"invalid exposure mode {self.mode!r}; "
+                f"expected one of {sorted(_NETWORK_BY_MODE)}"
+            )
+        if self.auth is None:
+            self.auth = self.mode == "tailnet"
+        if self.is_funnel:
+            if self.auth:
+                raise ValueError(
+                    "funnel traffic is unauthenticated and carries no Tailscale "
+                    "identity; use a separate tailnet exposure for an "
+                    "authenticated surface (e.g. funnel=True, tailnet=True)"
+                )
+            if self.port not in FUNNEL_PORTS:
+                raise ValueError(
+                    f"Tailscale Funnel only supports ports {FUNNEL_PORTS} "
+                    f"(got {self.port})"
+                )
+
+    @property
+    def is_funnel(self) -> bool:
+        return self.mode in ("funnel", "funnel-only")
+
+    @property
+    def network(self) -> str:
+        return _NETWORK_BY_MODE[self.mode]
+
+
+def _exposures_from_flags(funnel: bool, tailnet: bool) -> list["Exposure"]:
+    """Map the funnel/tailnet booleans (and CLI flags) to concrete exposures.
+
+    - neither            -> tailnet only on 443 (the default)
+    - funnel only        -> public funnel (+ tailnet) on 443
+    - funnel and tailnet -> public funnel-only on 443 + authenticated tailnet on 8443
+
+    When both are requested the funnel listener is ``funnel-only`` so the
+    authenticated tailnet listener is the single in-tailnet path, and the two
+    share one node on distinct ports (Funnel and a plain tailnet listener
+    cannot share a port on the same node).
+    """
+    if funnel and tailnet:
+        return [Exposure("funnel-only", 443), Exposure("tailnet", 8443)]
+    if funnel:
+        return [Exposure("funnel", 443)]
+    return [Exposure("tailnet", 443)]
+
+
 @dataclass
 class TailscaleUser:
     """Authenticated Tailscale user information."""
@@ -70,6 +151,8 @@ class TailscaleUser:
 HEADER_USER_NAME = "Tailscale-User-Name"
 HEADER_USER_LOGIN = "Tailscale-User-Login"
 HEADER_USER_PROFILE_PIC = "Tailscale-User-Profile-Pic"
+HEADER_NODE = "Tailscale-Node"           # tagged-node hostname (empty for user nodes)
+HEADER_TAGS = "Tailscale-Tags"           # comma-separated tags (empty for user nodes)
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +391,53 @@ def get_registered_statics(app: Any) -> list[StaticPath]:
         return list(getattr(app, "_caddytail_static", []))
 
 
+def expose(
+    app: Any,
+    mode: str = "tailnet",
+    *,
+    port: int = 443,
+    hostname: Optional[str] = None,
+    auth: Optional[bool] = None,
+) -> None:
+    """Register an exposure (listener) for the app, read by the runner at startup.
+
+    Mirrors :func:`static`. Lets app code declare funnel/tailnet intent without
+    CLI flags::
+
+        from caddytail import expose
+        expose(app, "funnel-only", port=443)   # public, unauthenticated
+        expose(app, "tailnet", port=8443)      # private, authenticated
+
+    See :class:`Exposure` for the mode semantics.
+    """
+    entry = Exposure(mode=mode, port=port, hostname=hostname, auth=auth)
+
+    framework = _detect_framework(app)
+    if framework == "flask":
+        if not hasattr(app, "extensions"):
+            app.extensions = {}
+        app.extensions.setdefault("caddytail_exposures", []).append(entry)
+    elif framework == "fastapi":
+        if not hasattr(app.state, "caddytail_exposures"):
+            app.state.caddytail_exposures = []
+        app.state.caddytail_exposures.append(entry)
+    else:
+        if not hasattr(app, "_caddytail_exposures"):
+            app._caddytail_exposures = []
+        app._caddytail_exposures.append(entry)
+
+
+def get_registered_exposures(app: Any) -> list[Exposure]:
+    """Read expose() registrations from an app."""
+    framework = _detect_framework(app)
+    if framework == "flask":
+        return list(getattr(app, "extensions", {}).get("caddytail_exposures", []))
+    elif framework == "fastapi":
+        return list(getattr(app.state, "caddytail_exposures", []))
+    else:
+        return list(getattr(app, "_caddytail_exposures", []))
+
+
 # ---------------------------------------------------------------------------
 # CaddyTail class — for programmatic use
 # ---------------------------------------------------------------------------
@@ -337,6 +467,9 @@ class CaddyTail:
         *,
         static: Optional[Union[dict[str, str], list[StaticPath]]] = None,
         debug: bool = False,
+        funnel: bool = False,
+        tailnet_listener: bool = False,
+        exposures: Optional[list[Exposure]] = None,
         tailnet: Optional[str] = None,
         caddy_path: Optional[Union[str, Path]] = None,
         app_port: Optional[int] = None,
@@ -346,6 +479,21 @@ class CaddyTail:
     ):
         self.app = app
         self.hostname = hostname
+
+        # Resolve which listeners to create. Priority:
+        #   explicit exposures= > funnel/tailnet_listener flags >
+        #   expose() registrations on the app > default (tailnet only).
+        if exposures is not None:
+            if funnel or tailnet_listener:
+                raise ValueError(
+                    "pass either exposures= or the funnel/tailnet_listener flags, not both"
+                )
+            self.exposures = list(exposures)
+        elif funnel or tailnet_listener:
+            self.exposures = _exposures_from_flags(funnel, tailnet_listener)
+        else:
+            registered = get_registered_exposures(app)
+            self.exposures = list(registered) if registered else [Exposure("tailnet", 443)]
 
         # Auto-detect tailnet if not provided
         if tailnet is None:
@@ -416,13 +564,37 @@ class CaddyTail:
 
         self.app.add_middleware(TailscaleUserMiddleware)
 
+    def _exposure_url(self, exposure: Exposure) -> str:
+        host = exposure.hostname or self.hostname
+        url = f"https://{host}.{self.tailnet}.ts.net"
+        if exposure.port != 443:
+            url += f":{exposure.port}"
+        return url
+
+    @property
+    def urls(self) -> list[tuple[Exposure, str]]:
+        """The (exposure, URL) pairs for every listener this instance serves."""
+        return [(e, self._exposure_url(e)) for e in self.exposures]
+
     @property
     def tailscale_url(self) -> str:
-        return f"https://{self.hostname}.{self.tailnet}.ts.net"
+        """Primary URL — the first tailnet exposure, else the first exposure."""
+        primary = next(
+            (e for e in self.exposures if e.mode == "tailnet"),
+            self.exposures[0],
+        )
+        return self._exposure_url(primary)
 
-    def generate_config(self) -> dict:
-        """Generate Caddy JSON configuration."""
-        routes = []
+    def _build_subroutes(self, exposure: Exposure) -> list[dict]:
+        """Static-file routes plus the terminal reverse_proxy for one exposure.
+
+        Static paths are shared across all exposures. The reverse_proxy either
+        injects the trusted Tailscale identity headers (authenticated tailnet
+        exposures) or *strips* them (funnel exposures) — on an unauthenticated
+        public listener a client could otherwise forge ``Tailscale-User-*``
+        headers and impersonate any user.
+        """
+        routes: list[dict] = []
 
         for sp in self.static_paths:
             local_path = str(Path(sp.local_path).resolve())
@@ -442,23 +614,86 @@ class CaddyTail:
                 "handle": [handler],
             })
 
+        if exposure.auth:
+            request_headers = {
+                "set": {
+                    HEADER_USER_LOGIN: ["{http.auth.user.tailscale_login}"],
+                    HEADER_USER_NAME: ["{http.auth.user.tailscale_name}"],
+                    HEADER_USER_PROFILE_PIC: ["{http.auth.user.tailscale_profile_picture}"],
+                    HEADER_NODE: ["{http.auth.user.tailscale_node}"],
+                    HEADER_TAGS: ["{http.auth.user.tailscale_tags}"],
+                }
+            }
+        else:
+            request_headers = {
+                "delete": [HEADER_USER_NAME, HEADER_USER_LOGIN,
+                           HEADER_USER_PROFILE_PIC, HEADER_NODE, HEADER_TAGS],
+            }
+
         routes.append({
             "handle": [{
                 "handler": "reverse_proxy",
                 "upstreams": [{"dial": f"localhost:{self.app_port}"}],
-                "headers": {
-                    "request": {
-                        "set": {
-                            HEADER_USER_LOGIN: ["{http.auth.user.tailscale_login}"],
-                            HEADER_USER_NAME: ["{http.auth.user.tailscale_name}"],
-                            HEADER_USER_PROFILE_PIC: ["{http.auth.user.tailscale_profile_picture}"],
-                        }
-                    }
-                },
+                "headers": {"request": request_headers},
             }],
         })
 
-        fqdn = f"{self.hostname}.{self.tailnet}.ts.net"
+        return routes
+
+    def _build_server(self, exposure: Exposure) -> dict:
+        """Build one Caddy HTTP server for a single exposure."""
+        host = exposure.hostname or self.hostname
+        fqdn = f"{host}.{self.tailnet}.ts.net"
+
+        handlers: list[dict] = []
+        if exposure.auth:
+            handlers.append({
+                "handler": "authentication",
+                "providers": {"tailscale": {}},
+            })
+        handlers.append({
+            "handler": "encode",
+            "encodings": {"zstd": {}, "gzip": {}},
+            "prefer": ["zstd", "gzip"],
+        })
+        handlers.append({
+            "handler": "subroute",
+            "routes": self._build_subroutes(exposure),
+        })
+
+        server: dict[str, Any] = {
+            "listen": [f"{exposure.network}/{host}:{exposure.port}"],
+            # Funnel listeners are TCP-only; HTTP/3 (UDP) is not available.
+            "protocols": ["h1", "h2"] if exposure.is_funnel else ["h1", "h2", "h3"],
+            "routes": [
+                {"match": [{"host": [fqdn]}]},
+                {"handle": handlers},
+            ],
+        }
+        if exposure.is_funnel:
+            # tsnet's funnel listener already terminates TLS; Caddy must not
+            # try to manage certs or redirect HTTP for this listener.
+            server["automatic_https"] = {"disable": True}
+
+        return server
+
+    def generate_config(self) -> dict:
+        """Generate Caddy JSON configuration."""
+        servers = {}
+        for exposure in self.exposures:
+            name = f"{exposure.mode.replace('-', '_')}_{exposure.port}"
+            servers[name] = self._build_server(exposure)
+
+        # One TLS automation policy per authenticated tailnet FQDN. Funnel
+        # listeners self-terminate TLS via tsnet, so they get no policy.
+        tailnet_fqdns = sorted({
+            f"{(e.hostname or self.hostname)}.{self.tailnet}.ts.net"
+            for e in self.exposures
+            if not e.is_funnel
+        })
+
+        # All distinct nodes referenced by the exposures.
+        node_hosts = sorted({e.hostname or self.hostname for e in self.exposures})
 
         config: dict[str, Any] = {
             "admin": {
@@ -468,52 +703,24 @@ class CaddyTail:
             "apps": {
                 "http": {
                     "http_port": self.caddy_http_port,
-                    "servers": {
-                        "tailscale_srv": {
-                            "listen": [f"tailscale/{self.hostname}:443"],
-                            "protocols": ["h1", "h2", "h3"],
-                            "routes": [
-                                {
-                                    "match": [{"host": [fqdn]}],
-                                },
-                                {
-                                    "handle": [
-                                        {
-                                            "handler": "authentication",
-                                            "providers": {"tailscale": {}},
-                                        },
-                                        {
-                                            "handler": "encode",
-                                            "encodings": {
-                                                "zstd": {},
-                                                "gzip": {},
-                                            },
-                                            "prefer": ["zstd", "gzip"],
-                                        },
-                                        {
-                                            "handler": "subroute",
-                                            "routes": routes,
-                                        },
-                                    ],
-                                }
-                            ],
-                        }
-                    },
-                },
-                "tls": {
-                    "automation": {
-                        "policies": [{
-                            "subjects": [fqdn],
-                            "get_certificate": [{"via": "tailscale"}],
-                        }],
-                    },
+                    "servers": servers,
                 },
                 "tailscale": {
                     **({"state_dir": str(self.state_dir)} if self.state_dir else {}),
-                    "nodes": {self.hostname: {}},
+                    "nodes": {host: {} for host in node_hosts},
                 },
             },
         }
+
+        if tailnet_fqdns:
+            config["apps"]["tls"] = {
+                "automation": {
+                    "policies": [{
+                        "subjects": tailnet_fqdns,
+                        "get_certificate": [{"via": "tailscale"}],
+                    }],
+                },
+            }
 
         if self.debug:
             config["logging"] = {
@@ -553,10 +760,16 @@ class CaddyTail:
                 time.sleep(interval)
         return False
 
+    def _print_urls(self) -> None:
+        print("Configuration loaded. URLs:")
+        for exposure, url in self.urls:
+            label = "public" if exposure.is_funnel else "tailnet"
+            print(f"  [{label}] {url}")
+
     def load_config(self) -> None:
         config = self.generate_config()
         self._api_request("/load", method="POST", data=config)
-        print(f"Configuration loaded. Tailscale URL: {self.tailscale_url}")
+        self._print_urls()
 
     def reload_config(self) -> None:
         self.load_config()
@@ -590,18 +803,22 @@ class CaddyTail:
 
         When no state_dir is set, both this and the caddy-tailscale plugin
         default to ~/.config/tsnet-caddy-{hostname}.
+
+        Runs once per distinct node referenced by the exposures.
         """
-        cmd = [
-            str(self.caddy_path), "tailscale-auth",
-            "--hostname", self.hostname,
-        ]
-        if self.state_dir:
-            cmd.extend(["--state-dir", str(self.state_dir / self.hostname)])
-        rc = subprocess.call(cmd)
-        if rc != 0:
-            raise RuntimeError(
-                f"Tailscale authentication failed for '{self.hostname}' (exit code {rc})"
-            )
+        node_hosts = sorted({e.hostname or self.hostname for e in self.exposures})
+        for host in node_hosts:
+            cmd = [
+                str(self.caddy_path), "tailscale-auth",
+                "--hostname", host,
+            ]
+            if self.state_dir:
+                cmd.extend(["--state-dir", str(self.state_dir / host)])
+            rc = subprocess.call(cmd)
+            if rc != 0:
+                raise RuntimeError(
+                    f"Tailscale authentication failed for '{host}' (exit code {rc})"
+                )
 
     def start_caddy(self) -> subprocess.Popen:
         if self._caddy_process is not None:
@@ -635,7 +852,7 @@ class CaddyTail:
             self.stop_caddy()
             raise RuntimeError("Caddy admin API did not become available")
 
-        print(f"Configuration loaded. Tailscale URL: {self.tailscale_url}")
+        self._print_urls()
 
         return self._caddy_process
 

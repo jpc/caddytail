@@ -21,6 +21,13 @@ usage: caddytail <command> [args...]
 commands:
   run <hostname> <app_ref>     Run app in foreground (Ctrl-C kills everything)
   install <hostname> <app_ref> Install as systemd service + tail logs
+
+exposure flags (for run / install):
+  --funnel                     Expose publicly via Tailscale Funnel
+  --tailnet                    Serve the authenticated tailnet listener
+                               (default when --funnel is absent; pass it
+                               alongside --funnel to get both)
+
   status <hostname>            Show service status
   logs <hostname> [-n N] [-f]  Show service logs
   restart <hostname>           Restart service
@@ -162,8 +169,10 @@ def _parse_env_args(env_list: list[str]) -> dict[str, str]:
 
 
 def _cmd_run(args: list[str]) -> int:
-    """caddytail run <hostname> <app_ref> [--debug] [--env K=V]"""
+    """caddytail run <hostname> <app_ref> [--funnel] [--tailnet] [--debug] [--env K=V]"""
     debug = "--debug" in args
+    funnel = "--funnel" in args
+    tailnet = "--tailnet" in args
 
     env_values: list[str] = []
     positional: list[str] = []
@@ -179,7 +188,11 @@ def _cmd_run(args: list[str]) -> int:
             i += 1
 
     if len(positional) < 2:
-        print("usage: caddytail run <hostname> <app_ref> [--debug] [--env K=V]", file=sys.stderr)
+        print(
+            "usage: caddytail run <hostname> <app_ref> "
+            "[--funnel] [--tailnet] [--debug] [--env K=V]",
+            file=sys.stderr,
+        )
         return 1
 
     if env_values:
@@ -189,13 +202,15 @@ def _cmd_run(args: list[str]) -> int:
     hostname, app_ref = positional[0], positional[1]
 
     from .runner import run
-    run(hostname, app_ref, debug=debug)
+    run(hostname, app_ref, debug=debug, funnel=funnel, tailnet_listener=tailnet)
     return 0
 
 
 def _cmd_install(args: list[str]) -> int:
-    """caddytail install <hostname> <app_ref> [--no-start] [--env K=V]"""
+    """caddytail install <hostname> <app_ref> [--funnel] [--tailnet] [--no-start] [--env K=V]"""
     no_start = "--no-start" in args
+    funnel = "--funnel" in args
+    tailnet_flag = "--tailnet" in args
 
     env_values: list[str] = []
     positional: list[str] = []
@@ -211,11 +226,21 @@ def _cmd_install(args: list[str]) -> int:
             i += 1
 
     if len(positional) < 2:
-        print("usage: caddytail install <hostname> <app_ref> [--no-start] [--env K=V]", file=sys.stderr)
+        print(
+            "usage: caddytail install <hostname> <app_ref> "
+            "[--funnel] [--tailnet] [--no-start] [--env K=V]",
+            file=sys.stderr,
+        )
         return 1
 
     hostname, app_ref = positional[0], positional[1]
     environment = _parse_env_args(env_values) if env_values else None
+
+    extra_args: list[str] = []
+    if funnel:
+        extra_args.append("--funnel")
+    if tailnet_flag:
+        extra_args.append("--tailnet")
 
     # Pre-flight auth check — authenticate the Tailscale node before
     # writing/starting the service, so interactive login can happen now.
@@ -243,6 +268,7 @@ def _cmd_install(args: list[str]) -> int:
             environment=environment,
             start=not no_start,
             tailscale_url=url,
+            extra_args=extra_args or None,
         )
     except (RuntimeError, FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -441,12 +467,15 @@ def main() -> int:
 
 from .api import (
     CaddyTail,
+    Exposure,
     StaticPath,
     TailscaleUser,
     get_user,
     get_user_or_error,
     login_required,
     static,
+    expose,
+    get_registered_exposures,
     get_tailnet_from_tailscale,
     # Legacy
     flask_user_required,
@@ -471,8 +500,11 @@ __all__ = [
     "get_user_or_error",
     "login_required",
     "static",
+    "expose",
+    "get_registered_exposures",
     # Types
     "CaddyTail",
+    "Exposure",
     "StaticPath",
     "TailscaleUser",
     # Utilities

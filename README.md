@@ -52,10 +52,10 @@ Hostname is always the first positional argument:
 
 ```bash
 # Development — foreground, Ctrl-C kills everything
-caddytail run <hostname> <app_ref> [--debug] [--env K=V]
+caddytail run <hostname> <app_ref> [--funnel] [--tailnet] [--debug] [--env K=V]
 
 # Production — install as systemd service + tail logs
-caddytail install <hostname> <app_ref> [--no-start] [--env K=V]
+caddytail install <hostname> <app_ref> [--funnel] [--tailnet] [--no-start] [--env K=V]
 
 # Service management
 caddytail status <hostname>
@@ -91,6 +91,38 @@ caddytail install myfiles caddytail.fileserver:app --env STATIC_PATH=/srv/files
 ```
 
 `STATIC_PATH` defaults to `.` (the working directory). The server provides directory listings and serves `index.html` when present.
+
+### Public exposure (Tailscale Funnel)
+
+By default an app is private to your tailnet and every request is
+Tailscale-authenticated. To expose it to the **public internet** via
+[Tailscale Funnel], add `--funnel`:
+
+```bash
+# Public only — anyone on the internet, no Tailscale auth
+caddytail run myapp app:app --funnel
+
+# Public funnel AND a private authenticated tailnet listener
+caddytail run myapp app:app --funnel --tailnet
+```
+
+- `--tailnet` is the implicit default. As soon as you pass `--funnel` it is no
+  longer added automatically — pass `--tailnet` explicitly to get both.
+- `--funnel` alone serves on `https://<hostname>.<tailnet>.ts.net` (port 443).
+- `--funnel --tailnet` serves the **public** funnel on `:443` and a separate
+  **authenticated** tailnet listener on `:8443`, both proxying the same app.
+
+Funnel must be [enabled in your tailnet ACL] and on the node, and only supports
+ports **443, 8443, 10000**.
+
+> **Identity & security.** Funnel traffic is anonymous — it carries no
+> Tailscale identity, so `get_user()` returns `None` on a funnel listener, and
+> caddytail strips any inbound `Tailscale-User-*` headers so a public client
+> cannot spoof a user. Gate anything sensitive behind the authenticated
+> `--tailnet` listener, not the funnel one.
+
+[Tailscale Funnel]: https://tailscale.com/kb/1223/funnel
+[enabled in your tailnet ACL]: https://tailscale.com/kb/1223/funnel#allow-funnel-access-in-acl
 
 ### Behavior
 
@@ -172,6 +204,31 @@ caddy.run()
 ```
 
 All ports are auto-allocated. No conflicts when running multiple apps.
+
+The `funnel` / `tailnet_listener` keyword arguments mirror the `--funnel` /
+`--tailnet` CLI flags:
+
+```python
+CaddyTail(app, "myapp")                                # tailnet only (default)
+CaddyTail(app, "myapp", funnel=True)                   # public funnel only
+CaddyTail(app, "myapp", funnel=True, tailnet_listener=True)  # public + authenticated
+```
+
+For full control, pass an explicit list of `Exposure` objects (or register them
+on the app with `expose()`, which the runner picks up):
+
+```python
+from caddytail import CaddyTail, Exposure, expose
+
+CaddyTail(app, "myapp", exposures=[
+    Exposure("funnel-only", port=443),   # public, unauthenticated
+    Exposure("tailnet", port=8443),      # private, authenticated
+])
+
+# …or declare it from app code, no CLI flags needed:
+expose(app, "funnel-only", port=443)
+expose(app, "tailnet", port=8443)
+```
 
 ## Framework Examples
 
