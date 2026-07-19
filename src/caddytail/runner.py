@@ -69,12 +69,18 @@ def run(
     debug: bool = False,
     funnel: bool = False,
     tailnet_listener: bool = False,
+    server: str = "dev",
+    workers: int = 1,
+    threads: int = 8,
 ) -> None:
     """Run an app with Caddy in the foreground. Ctrl-C kills everything.
 
     ``funnel`` / ``tailnet_listener`` mirror the ``--funnel`` / ``--tailnet``
     CLI flags. When neither is given, expose() registrations on the app are
     used, falling back to a tailnet-only listener.
+
+    ``server`` is ``"dev"`` (in-process) or ``"gunicorn"`` (a hardened
+    subprocess). ``workers`` / ``threads`` tune gunicorn.
     """
     app = _import_app(app_ref)
 
@@ -108,6 +114,10 @@ def run(
         caddy_admin_port=_find_free_port(),
         static=static_paths or None,
         exposures=exposures,
+        server=server,
+        workers=workers,
+        threads=threads,
+        app_ref=app_ref,
         debug=debug,
     )
 

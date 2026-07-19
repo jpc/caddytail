@@ -28,6 +28,13 @@ exposure flags (for run / install):
                                (default when --funnel is absent; pass it
                                alongside --funnel to get both)
 
+app server flags (for run / install):
+  --server dev|gunicorn        App server (default: dev). gunicorn is a
+                               hardened production server (pip install
+                               'caddytail[gunicorn]')
+  --workers N                  gunicorn worker processes (default: 1)
+  --threads N                  gunicorn threads per worker (default: 8)
+
   status <hostname>            Show service status
   logs <hostname> [-n N] [-f]  Show service logs
   restart <hostname>           Restart service
@@ -169,17 +176,22 @@ def _parse_env_args(env_list: list[str]) -> dict[str, str]:
 
 
 def _cmd_run(args: list[str]) -> int:
-    """caddytail run <hostname> <app_ref> [--funnel] [--tailnet] [--debug] [--env K=V]"""
+    """caddytail run <hostname> <app_ref> [--funnel] [--tailnet]
+    [--server dev|gunicorn] [--workers N] [--threads N] [--debug] [--env K=V]"""
     debug = "--debug" in args
     funnel = "--funnel" in args
     tailnet = "--tailnet" in args
 
     env_values: list[str] = []
+    opts: dict[str, str] = {}
     positional: list[str] = []
     i = 0
     while i < len(args):
         if args[i] == "--env" and i + 1 < len(args):
             env_values.append(args[i + 1])
+            i += 2
+        elif args[i] in ("--server", "--workers", "--threads") and i + 1 < len(args):
+            opts[args[i]] = args[i + 1]
             i += 2
         elif args[i].startswith("--"):
             i += 1
@@ -189,8 +201,8 @@ def _cmd_run(args: list[str]) -> int:
 
     if len(positional) < 2:
         print(
-            "usage: caddytail run <hostname> <app_ref> "
-            "[--funnel] [--tailnet] [--debug] [--env K=V]",
+            "usage: caddytail run <hostname> <app_ref> [--funnel] [--tailnet] "
+            "[--server dev|gunicorn] [--workers N] [--threads N] [--debug] [--env K=V]",
             file=sys.stderr,
         )
         return 1
@@ -200,24 +212,36 @@ def _cmd_run(args: list[str]) -> int:
             os.environ[key] = value
 
     hostname, app_ref = positional[0], positional[1]
+    server = opts.get("--server", "dev")
+    workers = int(opts.get("--workers", 1))
+    threads = int(opts.get("--threads", 8))
 
     from .runner import run
-    run(hostname, app_ref, debug=debug, funnel=funnel, tailnet_listener=tailnet)
+    run(
+        hostname, app_ref,
+        debug=debug, funnel=funnel, tailnet_listener=tailnet,
+        server=server, workers=workers, threads=threads,
+    )
     return 0
 
 
 def _cmd_install(args: list[str]) -> int:
-    """caddytail install <hostname> <app_ref> [--funnel] [--tailnet] [--no-start] [--env K=V]"""
+    """caddytail install <hostname> <app_ref> [--funnel] [--tailnet]
+    [--server dev|gunicorn] [--workers N] [--threads N] [--no-start] [--env K=V]"""
     no_start = "--no-start" in args
     funnel = "--funnel" in args
     tailnet_flag = "--tailnet" in args
 
     env_values: list[str] = []
+    opts: dict[str, str] = {}
     positional: list[str] = []
     i = 0
     while i < len(args):
         if args[i] == "--env" and i + 1 < len(args):
             env_values.append(args[i + 1])
+            i += 2
+        elif args[i] in ("--server", "--workers", "--threads") and i + 1 < len(args):
+            opts[args[i]] = args[i + 1]
             i += 2
         elif args[i].startswith("--"):
             i += 1
@@ -227,8 +251,8 @@ def _cmd_install(args: list[str]) -> int:
 
     if len(positional) < 2:
         print(
-            "usage: caddytail install <hostname> <app_ref> "
-            "[--funnel] [--tailnet] [--no-start] [--env K=V]",
+            "usage: caddytail install <hostname> <app_ref> [--funnel] [--tailnet] "
+            "[--server dev|gunicorn] [--workers N] [--threads N] [--no-start] [--env K=V]",
             file=sys.stderr,
         )
         return 1
@@ -241,6 +265,10 @@ def _cmd_install(args: list[str]) -> int:
         extra_args.append("--funnel")
     if tailnet_flag:
         extra_args.append("--tailnet")
+    # Forward the app-server selection into the systemd ExecStart.
+    for flag in ("--server", "--workers", "--threads"):
+        if flag in opts:
+            extra_args.extend([flag, opts[flag]])
 
     # Pre-flight auth check — authenticate the Tailscale node before
     # writing/starting the service, so interactive login can happen now.
