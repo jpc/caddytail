@@ -46,6 +46,7 @@ class StaticPath:
     local_path: str  # Local filesystem path
     methods: list[str] = field(default_factory=lambda: ["GET", "HEAD"])
     browse: bool = False  # Enable directory listings
+    index: list[str] = field(default_factory=list)  # index_names override (empty = Caddy default)
 
 
 # Ports Tailscale Funnel accepts. Mirrors the check in the caddy-tailscale
@@ -149,7 +150,8 @@ class TailscaleUser:
 # ---------------------------------------------------------------------------
 
 HEADER_USER_NAME = "Tailscale-User-Name"
-HEADER_USER_LOGIN = "Tailscale-User-Login"
+HEADER_USER_LOGIN = "Tailscale-User-Login"        # short form (localpart)
+HEADER_USER_EMAIL = "Tailscale-User-Email"        # full LoginName (email)
 HEADER_USER_PROFILE_PIC = "Tailscale-User-Profile-Pic"
 HEADER_NODE = "Tailscale-Node"           # tagged-node hostname (empty for user nodes)
 HEADER_TAGS = "Tailscale-Tags"           # comma-separated tags (empty for user nodes)
@@ -350,7 +352,8 @@ def login_required(fn: Optional[Callable] = None, *, request: Any = None) -> Any
     return wrapper
 
 
-def static(app: Any, url_path: str, local_path: str, *, browse: bool = False) -> None:
+def static(app: Any, url_path: str, local_path: str, *, browse: bool = False,
+           index: list[str] | None = None) -> None:
     """
     Register a static file path to be served by Caddy.
 
@@ -361,8 +364,13 @@ def static(app: Any, url_path: str, local_path: str, *, browse: bool = False) ->
         url_path: URL path pattern (e.g., "/assets/*")
         local_path: Local filesystem path (e.g., "./static")
         browse: Enable directory listings
+        index: Filenames to serve as directory indexes, tried in order
+            (Caddy's ``index_names``); None keeps Caddy's default
+            (index.html, index.txt). With ``browse``, directories without
+            any index file still get a listing.
     """
-    entry = StaticPath(url_path=url_path, local_path=local_path, browse=browse)
+    entry = StaticPath(url_path=url_path, local_path=local_path, browse=browse,
+                       index=list(index) if index else [])
 
     framework = _detect_framework(app)
     if framework == "flask":
@@ -642,6 +650,8 @@ class CaddyTail:
             }
             if sp.browse:
                 handler["browse"] = {}
+            if sp.index:
+                handler["index_names"] = sp.index
 
             routes.append({
                 "match": match,
@@ -652,6 +662,7 @@ class CaddyTail:
             request_headers = {
                 "set": {
                     HEADER_USER_LOGIN: ["{http.auth.user.tailscale_login}"],
+                    HEADER_USER_EMAIL: ["{http.auth.user.tailscale_user}"],
                     HEADER_USER_NAME: ["{http.auth.user.tailscale_name}"],
                     HEADER_USER_PROFILE_PIC: ["{http.auth.user.tailscale_profile_picture}"],
                     HEADER_NODE: ["{http.auth.user.tailscale_node}"],
@@ -660,7 +671,7 @@ class CaddyTail:
             }
         else:
             request_headers = {
-                "delete": [HEADER_USER_NAME, HEADER_USER_LOGIN,
+                "delete": [HEADER_USER_NAME, HEADER_USER_LOGIN, HEADER_USER_EMAIL,
                            HEADER_USER_PROFILE_PIC, HEADER_NODE, HEADER_TAGS],
             }
 
