@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import importlib
 import sys
-from typing import Any
+from typing import Any, Optional
 
 from .api import (
     CaddyTail,
@@ -60,7 +60,14 @@ def _import_app(app_ref: str) -> Any:
     return app
 
 
-def run(hostname: str, app_ref: str, *, debug: bool = False) -> None:
+def run(
+    hostname: str,
+    app_ref: str,
+    *,
+    debug: bool = False,
+    service: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+) -> None:
     """Run an app with Caddy in the foreground. Ctrl-C kills everything."""
     app = _import_app(app_ref)
 
@@ -88,9 +95,14 @@ def run(hostname: str, app_ref: str, *, debug: bool = False) -> None:
         caddy_admin_port=_find_free_port(),
         static=static_paths or None,
         debug=debug,
+        service=service,
+        tags=tags,
     )
 
-    print(f"\n  {app_ref} -> {caddy.tailscale_url}\n")
+    print(f"\n  {app_ref} -> {caddy.tailscale_url}")
+    if caddy.service_url:
+        print(f"  {app_ref} -> {caddy.service_url} (svc:{caddy.service})")
+    print()
 
     # CaddyTail.run() handles signals, starts Caddy, runs the app,
     # and blocks until shutdown.

@@ -149,6 +149,20 @@ def _detect_framework(app: Any) -> str:
         raise ValueError(f"Not a callable app: {app_module}.{type(app).__name__}")
 
 
+def normalize_service_name(name: str) -> str:
+    """Return a Tailscale Service name without its "svc:" prefix.
+
+    Accepts "svc:research" or "research"; returns "research".
+    """
+    bare = name[4:] if name.startswith("svc:") else name
+    if not bare or not all(c.isalnum() or c == "-" for c in bare):
+        raise ValueError(
+            f"Invalid Tailscale Service name {name!r} "
+            "(expected e.g. 'svc:research': letters, digits and dashes)"
+        )
+    return bare.lower()
+
+
 def get_tailnet_from_tailscale() -> Optional[str]:
     """
     Get the tailnet name from the running Tailscale daemon.
@@ -326,6 +340,10 @@ class CaddyTail:
         hostname: Tailscale hostname (e.g., "myapp")
         static: Extra static paths as a dict or list of StaticPath
         debug: Enable Caddy debug mode
+        service: Also advertise the app as this Tailscale Service
+                 (e.g. "svc:research"). Run the same app with the same service
+                 on several hosts for failover. The node must be tagged.
+        tags: ACL tags to advertise for the node (e.g. ["tag:research"])
         **kwargs: Override auto-detected settings (tailnet, caddy_path,
                   app_port, caddy_http_port, caddy_admin_port, state_dir)
     """
@@ -337,6 +355,8 @@ class CaddyTail:
         *,
         static: Optional[Union[dict[str, str], list[StaticPath]]] = None,
         debug: bool = False,
+        service: Optional[str] = None,
+        tags: Optional[list[str]] = None,
         tailnet: Optional[str] = None,
         caddy_path: Optional[Union[str, Path]] = None,
         app_port: Optional[int] = None,
@@ -371,6 +391,8 @@ class CaddyTail:
 
         self.state_dir = Path(state_dir).resolve() if state_dir else None
         self.debug = debug
+        self.service = normalize_service_name(service) if service else None
+        self.tags = list(tags) if tags else []
 
         # Normalize static paths
         self.static_paths: list[StaticPath] = []
@@ -420,6 +442,12 @@ class CaddyTail:
     def tailscale_url(self) -> str:
         return f"https://{self.hostname}.{self.tailnet}.ts.net"
 
+    @property
+    def service_url(self) -> Optional[str]:
+        if not self.service:
+            return None
+        return f"https://{self.service}.{self.tailnet}.ts.net"
+
     def generate_config(self) -> dict:
         """Generate Caddy JSON configuration."""
         routes = []
@@ -460,6 +488,29 @@ class CaddyTail:
 
         fqdn = f"{self.hostname}.{self.tailnet}.ts.net"
 
+        handle_chain = [
+            {
+                "handler": "authentication",
+                "providers": {"tailscale": {}},
+            },
+            {
+                "handler": "encode",
+                "encodings": {
+                    "zstd": {},
+                    "gzip": {},
+                },
+                "prefer": ["zstd", "gzip"],
+            },
+            {
+                "handler": "subroute",
+                "routes": routes,
+            },
+        ]
+
+        node_config: dict[str, Any] = {}
+        if self.tags:
+            node_config["tags"] = self.tags
+
         config: dict[str, Any] = {
             "admin": {
                 "listen": f"localhost:{self.caddy_admin_port}",
@@ -477,24 +528,7 @@ class CaddyTail:
                                     "match": [{"host": [fqdn]}],
                                 },
                                 {
-                                    "handle": [
-                                        {
-                                            "handler": "authentication",
-                                            "providers": {"tailscale": {}},
-                                        },
-                                        {
-                                            "handler": "encode",
-                                            "encodings": {
-                                                "zstd": {},
-                                                "gzip": {},
-                                            },
-                                            "prefer": ["zstd", "gzip"],
-                                        },
-                                        {
-                                            "handler": "subroute",
-                                            "routes": routes,
-                                        },
-                                    ],
+                                    "handle": handle_chain,
                                 }
                             ],
                         }
@@ -510,10 +544,23 @@ class CaddyTail:
                 },
                 "tailscale": {
                     **({"state_dir": str(self.state_dir)} if self.state_dir else {}),
-                    "nodes": {self.hostname: {}},
+                    "nodes": {self.hostname: node_config},
                 },
             },
         }
+
+        if self.service:
+            # Tailscale Service listener: tailscaled terminates TLS for the
+            # service FQDN and forwards plain HTTP/1.1 (with a PROXY header
+            # carrying the client address, so tailscale auth still works).
+            # Automatic HTTPS must be off, otherwise Caddy would try to speak
+            # TLS on this :443 listener.
+            config["apps"]["http"]["servers"]["tailscale_svc"] = {
+                "listen": [f"tailscale+svc/{self.service}@{self.hostname}:443"],
+                "protocols": ["h1"],
+                "automatic_https": {"disable": True},
+                "routes": [{"handle": handle_chain}],
+            }
 
         if self.debug:
             config["logging"] = {
@@ -597,6 +644,8 @@ class CaddyTail:
         ]
         if self.state_dir:
             cmd.extend(["--state-dir", str(self.state_dir / self.hostname)])
+        if self.tags:
+            cmd.extend(["--tags", ",".join(self.tags)])
         rc = subprocess.call(cmd)
         if rc != 0:
             raise RuntimeError(
@@ -636,6 +685,9 @@ class CaddyTail:
             raise RuntimeError("Caddy admin API did not become available")
 
         print(f"Configuration loaded. Tailscale URL: {self.tailscale_url}")
+        if self.service_url:
+            print(f"Advertising svc:{self.service} at {self.service_url} "
+                  "(needs host approval in the Tailscale admin console)")
 
         return self._caddy_process
 
