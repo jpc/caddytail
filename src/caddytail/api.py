@@ -453,6 +453,10 @@ def apply_middleware(app: Any, framework: Optional[str] = None) -> Any:
       real tailnet/funnel hostname).
     - FastAPI/Starlette: middleware that stashes the Tailscale user on
       request.state.
+    - Every kind of app: participant tokens (participant.py). Client-sent
+      Participant-* headers are removed and, when CADDYTAIL_PARTICIPANT_KEYS
+      is set, a verified token's claims are added in their place. A generic
+      WSGI/ASGI callable is wrapped, so use the returned app.
 
     Used both by the in-process dev server and by the caddytail.wsgi shim,
     so an external server (gunicorn) gets the same behaviour after it
@@ -461,9 +465,13 @@ def apply_middleware(app: Any, framework: Optional[str] = None) -> Any:
     if framework is None:
         framework = _detect_framework(app)
 
+    from . import participant
+
     if framework == "flask":
         from werkzeug.middleware.proxy_fix import ProxyFix
         app.wsgi_app = ProxyFix(app.wsgi_app, x_host=1)
+        # Participant-* headers are caddytail's to set (see participant.py).
+        app.wsgi_app = participant.WSGIMiddleware(app.wsgi_app)
     elif framework == "fastapi":
         from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.requests import Request
@@ -476,7 +484,11 @@ def apply_middleware(app: Any, framework: Optional[str] = None) -> Any:
                 return await call_next(request)
 
         app.add_middleware(TailscaleUserMiddleware)
-    # Generic WSGI/ASGI callables need no middleware.
+        app.add_middleware(participant.ASGIMiddleware)
+    elif framework == "asgi":
+        return participant.ASGIMiddleware(app)
+    elif framework == "wsgi":
+        return participant.WSGIMiddleware(app)
     return app
 
 
@@ -604,7 +616,8 @@ class CaddyTail:
         return f"http://localhost:{self.caddy_admin_port}"
 
     def _setup_middleware(self) -> None:
-        apply_middleware(self.app, self._framework)
+        # A generic WSGI/ASGI callable comes back wrapped; registrations were read above.
+        self.app = apply_middleware(self.app, self._framework)
 
     def _exposure_url(self, exposure: Exposure) -> str:
         host = exposure.hostname or self.hostname

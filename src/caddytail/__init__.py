@@ -509,6 +509,7 @@ from .api import (
     flask_user_required,
     fastapi_user_dependency,
 )
+from .participant import Participant, get_participant
 from .systemd import (
     install_service,
     uninstall_service,
@@ -525,6 +526,8 @@ __all__ = [
     "main",
     # New standalone API
     "get_user",
+    "get_participant",
+    "Participant",
     "get_user_or_error",
     "login_required",
     "static",

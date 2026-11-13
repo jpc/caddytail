@@ -189,6 +189,71 @@ if user:
     print(user.profile_pic) # "https://..."
 ```
 
+### `get_participant()`
+
+`get_user()` covers staff on the tailnet. A participant is someone who comes in
+over the public funnel: they have no Tailscale identity, so the app that admits
+them (the *issuer*) signs a short-lived token saying who they are, and every
+other app can recognise them from it.
+
+```python
+from caddytail import get_participant
+
+@app.get("/task")
+def task():
+    p = get_participant()          # Flask; pass the Request (FastAPI) or environ (WSGI)
+    if p is None:
+        abort(403)
+    return f"{p.id} in {p.study}, block {p.block}, test={p.test}"
+```
+
+Tell caddytail where the issuer publishes its public keys:
+
+```bash
+caddytail run myapp app:app --funnel --env CADDYTAIL_PARTICIPANT_KEYS=https://issuer.example/.well-known/participant-keys.json
+```
+
+caddytail then verifies the token on each request and hands the app
+`Participant-Id`, `-Kind`, `-Study`, `-Cohort`, `-Block`, `-Test`, `-Issuer`,
+`-Expires` and `-Claims` (all claims as JSON) request headers. Headers of those
+names sent by a client are always removed, so an app can trust them.
+
+| Setting | Meaning |
+|---|---|
+| `CADDYTAIL_PARTICIPANT_KEYS` | an https address serving `{"keys": ["k4.public...."]}`, and/or the keys themselves, comma-separated. Unset: nothing is verified |
+| `CADDYTAIL_PARTICIPANT_ISSUER` | only accept tokens whose `iss` is exactly this |
+| `CADDYTAIL_PARTICIPANT_AUDIENCE` | only accept tokens whose `aud` is exactly this |
+| `CADDYTAIL_PARTICIPANT_HEADERS` | more request headers to read the token from |
+
+The client sends the token as `Participant-Token: <token>` or
+`Authorization: Bearer <token>`.
+
+- **Format.** PASETO `v4.public`: an Ed25519 signature (libsodium, through
+  PyNaCl; `cryptography` also works) over a JSON payload. Apps hold only public
+  keys, so they can check a token but not make one. Install with
+  `pip install 'caddytail[participants]'`.
+- **Keys.** An address is fetched on first use, again every hour, and sooner
+  when a token names a key not seen before, so a new key at the issuer is
+  picked up without a restart. If a fetch fails the known keys stay in use.
+  Whoever controls that address decides who is a participant, which is why it
+  must be https.
+- **Limits.** A token is valid until it expires and cannot be revoked; anything
+  that needs counting ("one submission") stays with the issuer. Any app that
+  receives a token could present it to another app; set an audience where that
+  matters.
+- **Where it runs.** In caddytail's Python layer around the app, not in the
+  Caddy binary, so it applies to every app started with `caddytail run`.
+
+An issuer uses the same module:
+
+```python
+from caddytail import participant
+
+key = participant.generate_key()                 # "k4.secret....", keep private
+token = participant.mint(key, {"sub": pid, "kind": "prolific", "study": "s1"}, ttl_s=4 * 3600)
+participant.public_key(key)                      # "k4.public....", publish in {"keys": [...]}
+```
+
 ### `login_required`
 
 Works as both a Flask decorator and a FastAPI `Depends()` target:
