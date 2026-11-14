@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import importlib
 import sys
-from typing import Any
+from typing import Any, Optional
 
 from .api import (
     CaddyTail,
@@ -72,6 +72,8 @@ def run(
     server: str = "dev",
     workers: int = 1,
     threads: int = 8,
+    service: Optional[str] = None,
+    tags: Optional[list[str]] = None,
 ) -> None:
     """Run an app with Caddy in the foreground. Ctrl-C kills everything.
 
@@ -81,6 +83,9 @@ def run(
 
     ``server`` is ``"dev"`` (in-process) or ``"gunicorn"`` (a hardened
     subprocess). ``workers`` / ``threads`` tune gunicorn.
+
+    ``service`` advertises the app as a Tailscale Service as well; the node
+    must then carry ``tags``.
     """
     app = _import_app(app_ref)
 
@@ -119,10 +124,15 @@ def run(
         threads=threads,
         app_ref=app_ref,
         debug=debug,
+        service=service,
+        tags=tags,
     )
 
     urls = "\n  ".join(f"{app_ref} -> {url}" for _, url in caddy.urls)
-    print(f"\n  {urls}\n")
+    print(f"\n  {urls}")
+    if caddy.service_url:
+        print(f"  {app_ref} -> {caddy.service_url} (svc:{caddy.service})")
+    print()
 
     # CaddyTail.run() handles signals, starts Caddy, runs the app,
     # and blocks until shutdown.

@@ -52,10 +52,10 @@ Hostname is always the first positional argument:
 
 ```bash
 # Development — foreground, Ctrl-C kills everything
-caddytail run <hostname> <app_ref> [--funnel] [--tailnet] [--server dev|gunicorn] [--workers N] [--threads N] [--debug] [--env K=V]
+caddytail run <hostname> <app_ref> [--funnel] [--tailnet] [--server dev|gunicorn] [--workers N] [--threads N] [--debug] [--env K=V] [--service svc:NAME] [--tag tag:NAME]
 
 # Production — install as systemd service + tail logs
-caddytail install <hostname> <app_ref> [--funnel] [--tailnet] [--server dev|gunicorn] [--workers N] [--threads N] [--no-start] [--env K=V]
+caddytail install <hostname> <app_ref> [--funnel] [--tailnet] [--server dev|gunicorn] [--workers N] [--threads N] [--no-start] [--env K=V] [--service svc:NAME] [--tag tag:NAME]
 
 # Service management
 caddytail status <hostname>
@@ -67,7 +67,7 @@ caddytail uninstall <hostname>
 caddytail list
 
 # Pre-provision Tailscale authentication
-caddytail login <hostname> [--auth-key <key>]
+caddytail login <hostname> [--auth-key <key>] [--tag tag:NAME]
 
 # Raw Caddy pass-through
 caddytail caddy [args...]
@@ -153,6 +153,32 @@ port, alongside Caddy. Defaults:
 and `get_user()` behave exactly as under the dev server.
 
 [gunicorn]: https://gunicorn.org/
+
+### Tailscale Services (failover)
+
+To serve one app from several machines under a single name, advertise it as a
+[Tailscale Service](https://tailscale.com/kb/1552/tailscale-services). Run the same
+app on each host with a **different hostname** and the same `--service`:
+
+```bash
+# on host A
+caddytail install research-a app:app --service svc:research --tag tag:research
+# on host B
+caddytail install research-b app:app --service svc:research --tag tag:research
+```
+
+Clients use `https://research.<tailnet>.ts.net`, and Tailscale routes them to a healthy
+host. Each node still serves its own `https://research-a.<tailnet>.ts.net` URL too.
+
+Requirements:
+- The Service (`svc:research`) must exist in the admin console with port `tcp:443`.
+- Service hosts must be **tagged nodes**. `--tag` advertises tags when a node is first
+  authenticated (you must be an owner of the tag, or use a tagged `--auth-key`). For a
+  node that is already logged in, add the tag in the admin console instead.
+- Each host must be approved for the Service, either manually or by an
+  `autoApprovers.services` rule in the policy file.
+
+`get_user()` and `login_required` work the same on the Service URL.
 
 ### Behavior
 

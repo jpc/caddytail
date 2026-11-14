@@ -234,6 +234,20 @@ def _detect_framework(app: Any) -> str:
         raise ValueError(f"Not a callable app: {app_module}.{type(app).__name__}")
 
 
+def normalize_service_name(name: str) -> str:
+    """Return a Tailscale Service name without its "svc:" prefix.
+
+    Accepts "svc:research" or "research"; returns "research".
+    """
+    bare = name[4:] if name.startswith("svc:") else name
+    if not bare or not all(c.isalnum() or c == "-" for c in bare):
+        raise ValueError(
+            f"Invalid Tailscale Service name {name!r} "
+            "(expected e.g. 'svc:research': letters, digits and dashes)"
+        )
+    return bare.lower()
+
+
 def get_tailnet_from_tailscale() -> Optional[str]:
     """
     Get the tailnet name from the running Tailscale daemon.
@@ -510,6 +524,10 @@ class CaddyTail:
         hostname: Tailscale hostname (e.g., "myapp")
         static: Extra static paths as a dict or list of StaticPath
         debug: Enable Caddy debug mode
+        service: Also advertise the app as this Tailscale Service
+                 (e.g. "svc:research"). Run the same app with the same service
+                 on several hosts for failover. The node must be tagged.
+        tags: ACL tags to advertise for the node (e.g. ["tag:research"])
         **kwargs: Override auto-detected settings (tailnet, caddy_path,
                   app_port, caddy_http_port, caddy_admin_port, state_dir)
     """
@@ -528,6 +546,8 @@ class CaddyTail:
         workers: int = 1,
         threads: int = 8,
         app_ref: Optional[str] = None,
+        service: Optional[str] = None,
+        tags: Optional[list[str]] = None,
         tailnet: Optional[str] = None,
         caddy_path: Optional[Union[str, Path]] = None,
         app_port: Optional[int] = None,
@@ -588,6 +608,8 @@ class CaddyTail:
 
         self.state_dir = Path(state_dir).resolve() if state_dir else None
         self.debug = debug
+        self.service = normalize_service_name(service) if service else None
+        self.tags = list(tags) if tags else []
 
         # Normalize static paths
         self.static_paths: list[StaticPath] = []
@@ -639,6 +661,12 @@ class CaddyTail:
             self.exposures[0],
         )
         return self._exposure_url(primary)
+
+    @property
+    def service_url(self) -> Optional[str]:
+        if not self.service:
+            return None
+        return f"https://{self.service}.{self.tailnet}.ts.net"
 
     def _build_subroutes(self, exposure: Exposure) -> list[dict]:
         """Static-file routes plus the terminal reverse_proxy for one exposure.
@@ -698,11 +726,8 @@ class CaddyTail:
 
         return routes
 
-    def _build_server(self, exposure: Exposure) -> dict:
-        """Build one Caddy HTTP server for a single exposure."""
-        host = exposure.hostname or self.hostname
-        fqdn = f"{host}.{self.tailnet}.ts.net"
-
+    def _build_handlers(self, exposure: Exposure) -> list[dict]:
+        """The handler chain for one exposure: auth (if any), encode, routes."""
         handlers: list[dict] = []
         if exposure.auth:
             handlers.append({
@@ -718,6 +743,14 @@ class CaddyTail:
             "handler": "subroute",
             "routes": self._build_subroutes(exposure),
         })
+        return handlers
+
+    def _build_server(self, exposure: Exposure) -> dict:
+        """Build one Caddy HTTP server for a single exposure."""
+        host = exposure.hostname or self.hostname
+        fqdn = f"{host}.{self.tailnet}.ts.net"
+
+        handlers = self._build_handlers(exposure)
 
         server: dict[str, Any] = {
             "listen": [f"{exposure.network}/{host}:{exposure.port}"],
@@ -753,6 +786,10 @@ class CaddyTail:
         # All distinct nodes referenced by the exposures.
         node_hosts = sorted({e.hostname or self.hostname for e in self.exposures})
 
+        node_config: dict[str, Any] = {}
+        if self.tags:
+            node_config["tags"] = self.tags
+
         config: dict[str, Any] = {
             "admin": {
                 "listen": f"localhost:{self.caddy_admin_port}",
@@ -765,7 +802,12 @@ class CaddyTail:
                 },
                 "tailscale": {
                     **({"state_dir": str(self.state_dir)} if self.state_dir else {}),
-                    "nodes": {host: {} for host in node_hosts},
+                    # Tags belong to the app's own node (the one a Service is
+                    # advertised from).
+                    "nodes": {
+                        host: (node_config if host == self.hostname else {})
+                        for host in node_hosts
+                    },
                 },
             },
         }
@@ -778,6 +820,20 @@ class CaddyTail:
                         "get_certificate": [{"via": "tailscale"}],
                     }],
                 },
+            }
+
+        if self.service:
+            # Tailscale Service listener: tailscaled terminates TLS for the
+            # service FQDN and forwards plain HTTP/1.1 (with a PROXY header
+            # carrying the client address, so tailscale auth still works).
+            # Automatic HTTPS must be off, otherwise Caddy would try to speak
+            # TLS on this :443 listener. It is an authenticated tailnet
+            # surface, so it gets the same handlers as a tailnet exposure.
+            config["apps"]["http"]["servers"]["tailscale_svc"] = {
+                "listen": [f"tailscale+svc/{self.service}@{self.hostname}:443"],
+                "protocols": ["h1"],
+                "automatic_https": {"disable": True},
+                "routes": [{"handle": self._build_handlers(Exposure(mode="tailnet"))}],
             }
 
         if self.debug:
@@ -823,6 +879,9 @@ class CaddyTail:
         for exposure, url in self.urls:
             label = "public" if exposure.is_funnel else "tailnet"
             print(f"  [{label}] {url}")
+        if self.service_url:
+            print(f"  [service] {self.service_url} (svc:{self.service}; "
+                  "needs host approval in the Tailscale admin console)")
 
     def load_config(self) -> None:
         config = self.generate_config()
@@ -872,6 +931,8 @@ class CaddyTail:
             ]
             if self.state_dir:
                 cmd.extend(["--state-dir", str(self.state_dir / host)])
+            if self.tags and host == self.hostname:
+                cmd.extend(["--tags", ",".join(self.tags)])
             rc = subprocess.call(cmd)
             if rc != 0:
                 raise RuntimeError(
