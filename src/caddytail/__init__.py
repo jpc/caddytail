@@ -1,8 +1,11 @@
 """Caddy web server with Tailscale plugin, packaged for pip installation."""
 
+from __future__ import annotations
+
 import os
 import subprocess
 import sys
+from typing import Optional
 
 try:
     from ._version import version as __version__
@@ -28,6 +31,13 @@ exposure flags (for run / install):
                                (default when --funnel is absent; pass it
                                alongside --funnel to get both)
 
+app server flags (for run / install):
+  --server dev|gunicorn        App server (default: dev). gunicorn is a
+                               hardened production server (pip install
+                               'caddytail[gunicorn]')
+  --workers N                  gunicorn worker processes (default: 1)
+  --threads N                  gunicorn threads per worker (default: 8)
+
   status <hostname>            Show service status
   logs <hostname> [-n N] [-f]  Show service logs
   restart <hostname>           Restart service
@@ -35,6 +45,11 @@ exposure flags (for run / install):
   list                         List installed services
   login <hostname>              Authenticate Tailscale node
   caddy [args...]              Raw Caddy pass-through
+
+run/install options:
+  --service svc:NAME           Also advertise as a Tailscale Service (for failover,
+                               run on several hosts with different hostnames)
+  --tag tag:NAME               Advertise an ACL tag (Service hosts must be tagged)
 """
 
 
@@ -168,31 +183,85 @@ def _parse_env_args(env_list: list[str]) -> dict[str, str]:
     return result
 
 
-def _cmd_run(args: list[str]) -> int:
-    """caddytail run <hostname> <app_ref> [--funnel] [--tailnet] [--debug] [--env K=V]"""
-    debug = "--debug" in args
-    funnel = "--funnel" in args
-    tailnet = "--tailnet" in args
+_RUN_USAGE = (
+    "usage: caddytail run <hostname> <app_ref> [--funnel] [--tailnet] "
+    "[--server dev|gunicorn] [--workers N] [--threads N] [--debug] [--env K=V] "
+    "[--service svc:NAME] [--tag tag:NAME]"
+)
+_INSTALL_USAGE = (
+    "usage: caddytail install <hostname> <app_ref> [--funnel] [--tailnet] "
+    "[--server dev|gunicorn] [--workers N] [--threads N] [--no-start] [--env K=V] "
+    "[--service svc:NAME] [--tag tag:NAME]"
+)
+_SERVER_OPTS = ("--server", "--workers", "--threads")
 
-    env_values: list[str] = []
+
+def _split_args(args: list[str]) -> tuple[list[str], dict[str, list[str]], set[str]]:
+    """Split CLI args into (positional, valued options, boolean flags).
+
+    ``--env``, ``--service`` and ``--tag`` take a value and may be repeated;
+    ``--tag`` also accepts comma-separated values. ``--server``, ``--workers``
+    and ``--threads`` take one value (the last given wins).
+    """
+    valued: dict[str, list[str]] = {"--env": [], "--service": [], "--tag": []}
+    valued.update({flag: [] for flag in _SERVER_OPTS})
+    flags: set[str] = set()
     positional: list[str] = []
     i = 0
     while i < len(args):
-        if args[i] == "--env" and i + 1 < len(args):
-            env_values.append(args[i + 1])
+        if args[i] in valued and i + 1 < len(args):
+            valued[args[i]].append(args[i + 1])
             i += 2
         elif args[i].startswith("--"):
+            flags.add(args[i])
             i += 1
         else:
             positional.append(args[i])
             i += 1
+    valued["--tag"] = [t.strip() for v in valued["--tag"] for t in v.split(",") if t.strip()]
+    return positional, valued, flags
+
+
+def _service_opts(valued: dict[str, list[str]]) -> tuple[Optional[str], list[str]]:
+    """Validate --service/--tag and return (service, tags)."""
+    services = valued["--service"]
+    if len(services) > 1:
+        raise ValueError("only one --service may be given")
+    service = services[0] if services else None
+    if service:
+        from .api import normalize_service_name
+        normalize_service_name(service)  # validate early
+    tags = valued["--tag"]
+    for t in tags:
+        if not t.startswith("tag:"):
+            raise ValueError(f"invalid tag {t!r} (tags must start with 'tag:')")
+    return service, tags
+
+
+def _server_opts(valued: dict[str, list[str]]) -> dict[str, str]:
+    """The app-server options that were given, by flag."""
+    return {flag: valued[flag][-1] for flag in _SERVER_OPTS if valued[flag]}
+
+
+def _cmd_run(args: list[str]) -> int:
+    """caddytail run <hostname> <app_ref> [--funnel] [--tailnet]
+    [--server dev|gunicorn] [--workers N] [--threads N] [--debug] [--env K=V]
+    [--service svc:X] [--tag tag:X]"""
+    positional, valued, flags = _split_args(args)
+    debug = "--debug" in flags
+    funnel = "--funnel" in flags
+    tailnet = "--tailnet" in flags
+    env_values = valued["--env"]
+    opts = _server_opts(valued)
 
     if len(positional) < 2:
-        print(
-            "usage: caddytail run <hostname> <app_ref> "
-            "[--funnel] [--tailnet] [--debug] [--env K=V]",
-            file=sys.stderr,
-        )
+        print(_RUN_USAGE, file=sys.stderr)
+        return 1
+
+    try:
+        service, tags = _service_opts(valued)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     if env_values:
@@ -200,37 +269,39 @@ def _cmd_run(args: list[str]) -> int:
             os.environ[key] = value
 
     hostname, app_ref = positional[0], positional[1]
+    server = opts.get("--server", "dev")
+    workers = int(opts.get("--workers", 1))
+    threads = int(opts.get("--threads", 8))
 
     from .runner import run
-    run(hostname, app_ref, debug=debug, funnel=funnel, tailnet_listener=tailnet)
+    run(
+        hostname, app_ref,
+        debug=debug, funnel=funnel, tailnet_listener=tailnet,
+        server=server, workers=workers, threads=threads,
+        service=service, tags=tags,
+    )
     return 0
 
 
 def _cmd_install(args: list[str]) -> int:
-    """caddytail install <hostname> <app_ref> [--funnel] [--tailnet] [--no-start] [--env K=V]"""
-    no_start = "--no-start" in args
-    funnel = "--funnel" in args
-    tailnet_flag = "--tailnet" in args
-
-    env_values: list[str] = []
-    positional: list[str] = []
-    i = 0
-    while i < len(args):
-        if args[i] == "--env" and i + 1 < len(args):
-            env_values.append(args[i + 1])
-            i += 2
-        elif args[i].startswith("--"):
-            i += 1
-        else:
-            positional.append(args[i])
-            i += 1
+    """caddytail install <hostname> <app_ref> [--funnel] [--tailnet]
+    [--server dev|gunicorn] [--workers N] [--threads N] [--no-start] [--env K=V]
+    [--service svc:X] [--tag tag:X]"""
+    positional, valued, flags = _split_args(args)
+    no_start = "--no-start" in flags
+    funnel = "--funnel" in flags
+    tailnet_flag = "--tailnet" in flags
+    env_values = valued["--env"]
+    opts = _server_opts(valued)
 
     if len(positional) < 2:
-        print(
-            "usage: caddytail install <hostname> <app_ref> "
-            "[--funnel] [--tailnet] [--no-start] [--env K=V]",
-            file=sys.stderr,
-        )
+        print(_INSTALL_USAGE, file=sys.stderr)
+        return 1
+
+    try:
+        service, tags = _service_opts(valued)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     hostname, app_ref = positional[0], positional[1]
@@ -241,6 +312,10 @@ def _cmd_install(args: list[str]) -> int:
         extra_args.append("--funnel")
     if tailnet_flag:
         extra_args.append("--tailnet")
+    # Forward the app-server selection into the systemd ExecStart.
+    for flag in ("--server", "--workers", "--threads"):
+        if flag in opts:
+            extra_args.extend([flag, opts[flag]])
 
     # Pre-flight auth check — authenticate the Tailscale node before
     # writing/starting the service, so interactive login can happen now.
@@ -250,7 +325,10 @@ def _cmd_install(args: list[str]) -> int:
         return 1
     if sys.platform != "win32":
         os.chmod(binary, 0o755)
-    rc = subprocess.call([binary, "tailscale-auth", "--hostname", hostname])
+    auth_cmd = [binary, "tailscale-auth", "--hostname", hostname]
+    if tags:
+        auth_cmd.extend(["--tags", ",".join(tags)])
+    rc = subprocess.call(auth_cmd)
     if rc != 0:
         print(f"Error: Tailscale authentication failed for '{hostname}' (exit code {rc})", file=sys.stderr)
         return 1
@@ -259,6 +337,10 @@ def _cmd_install(args: list[str]) -> int:
     from .api import get_tailnet_from_tailscale
     tailnet = get_tailnet_from_tailscale()
     url = f"https://{hostname}.{tailnet}.ts.net" if tailnet else None
+    service_url = None
+    if service and tailnet:
+        from .api import normalize_service_name
+        service_url = f"https://{normalize_service_name(service)}.{tailnet}.ts.net"
 
     from .systemd import install_service
     try:
@@ -266,9 +348,12 @@ def _cmd_install(args: list[str]) -> int:
             hostname,
             app_ref,
             environment=environment,
+            service=service,
+            tags=tags,
             start=not no_start,
             tailscale_url=url,
             extra_args=extra_args or None,
+            service_url=service_url,
         )
     except (RuntimeError, FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -374,11 +459,12 @@ def _cmd_list(args: list[str]) -> int:
 
 
 def _cmd_login(args: list[str]) -> int:
-    """caddytail login <hostname> [--state-dir <dir>] [--auth-key <key>]"""
+    """caddytail login <hostname> [--state-dir <dir>] [--auth-key <key>] [--tag tag:NAME]"""
     from pathlib import Path
 
     state_dir = None
     auth_key = None
+    tags: list[str] = []
     positional: list[str] = []
     i = 0
     while i < len(args):
@@ -388,6 +474,9 @@ def _cmd_login(args: list[str]) -> int:
         elif args[i] == "--auth-key" and i + 1 < len(args):
             auth_key = args[i + 1]
             i += 2
+        elif args[i] == "--tag" and i + 1 < len(args):
+            tags.extend(t.strip() for t in args[i + 1].split(",") if t.strip())
+            i += 2
         elif args[i].startswith("--"):
             i += 1
         else:
@@ -395,7 +484,7 @@ def _cmd_login(args: list[str]) -> int:
             i += 1
 
     if not positional:
-        print("usage: caddytail login <hostname> [--state-dir <dir>] [--auth-key <key>]", file=sys.stderr)
+        print("usage: caddytail login <hostname> [--state-dir <dir>] [--auth-key <key>] [--tag tag:NAME]", file=sys.stderr)
         return 1
 
     hostname = positional[0]
@@ -413,6 +502,8 @@ def _cmd_login(args: list[str]) -> int:
         cmd.extend(["--state-dir", str(Path(state_dir).resolve() / hostname)])
     if auth_key:
         cmd.extend(["--auth-key", auth_key])
+    if tags:
+        cmd.extend(["--tags", ",".join(tags)])
 
     return subprocess.call(cmd)
 
@@ -481,6 +572,7 @@ from .api import (
     flask_user_required,
     fastapi_user_dependency,
 )
+from .participant import Participant, get_participant
 from .systemd import (
     install_service,
     uninstall_service,
@@ -497,6 +589,8 @@ __all__ = [
     "main",
     # New standalone API
     "get_user",
+    "get_participant",
+    "Participant",
     "get_user_or_error",
     "login_required",
     "static",

@@ -46,6 +46,7 @@ class StaticPath:
     local_path: str  # Local filesystem path
     methods: list[str] = field(default_factory=lambda: ["GET", "HEAD"])
     browse: bool = False  # Enable directory listings
+    index: list[str] = field(default_factory=list)  # index_names override (empty = Caddy default)
 
 
 # Ports Tailscale Funnel accepts. Mirrors the check in the caddy-tailscale
@@ -149,7 +150,8 @@ class TailscaleUser:
 # ---------------------------------------------------------------------------
 
 HEADER_USER_NAME = "Tailscale-User-Name"
-HEADER_USER_LOGIN = "Tailscale-User-Login"
+HEADER_USER_LOGIN = "Tailscale-User-Login"        # short form (localpart)
+HEADER_USER_EMAIL = "Tailscale-User-Email"        # full LoginName (email)
 HEADER_USER_PROFILE_PIC = "Tailscale-User-Profile-Pic"
 HEADER_NODE = "Tailscale-Node"           # tagged-node hostname (empty for user nodes)
 HEADER_TAGS = "Tailscale-Tags"           # comma-separated tags (empty for user nodes)
@@ -230,6 +232,20 @@ def _detect_framework(app: Any) -> str:
         return "wsgi"
     else:
         raise ValueError(f"Not a callable app: {app_module}.{type(app).__name__}")
+
+
+def normalize_service_name(name: str) -> str:
+    """Return a Tailscale Service name without its "svc:" prefix.
+
+    Accepts "svc:research" or "research"; returns "research".
+    """
+    bare = name[4:] if name.startswith("svc:") else name
+    if not bare or not all(c.isalnum() or c == "-" for c in bare):
+        raise ValueError(
+            f"Invalid Tailscale Service name {name!r} "
+            "(expected e.g. 'svc:research': letters, digits and dashes)"
+        )
+    return bare.lower()
 
 
 def get_tailnet_from_tailscale() -> Optional[str]:
@@ -350,7 +366,8 @@ def login_required(fn: Optional[Callable] = None, *, request: Any = None) -> Any
     return wrapper
 
 
-def static(app: Any, url_path: str, local_path: str, *, browse: bool = False) -> None:
+def static(app: Any, url_path: str, local_path: str, *, browse: bool = False,
+           index: list[str] | None = None) -> None:
     """
     Register a static file path to be served by Caddy.
 
@@ -361,8 +378,13 @@ def static(app: Any, url_path: str, local_path: str, *, browse: bool = False) ->
         url_path: URL path pattern (e.g., "/assets/*")
         local_path: Local filesystem path (e.g., "./static")
         browse: Enable directory listings
+        index: Filenames to serve as directory indexes, tried in order
+            (Caddy's ``index_names``); None keeps Caddy's default
+            (index.html, index.txt). With ``browse``, directories without
+            any index file still get a listing.
     """
-    entry = StaticPath(url_path=url_path, local_path=local_path, browse=browse)
+    entry = StaticPath(url_path=url_path, local_path=local_path, browse=browse,
+                       index=list(index) if index else [])
 
     framework = _detect_framework(app)
     if framework == "flask":
@@ -438,6 +460,52 @@ def get_registered_exposures(app: Any) -> list[Exposure]:
         return list(getattr(app, "_caddytail_exposures", []))
 
 
+def apply_middleware(app: Any, framework: Optional[str] = None) -> Any:
+    """Apply the framework-appropriate caddytail middleware and return the app.
+
+    - Flask: ProxyFix (trust X-Forwarded-Host so redirects/url_for use the
+      real tailnet/funnel hostname).
+    - FastAPI/Starlette: middleware that stashes the Tailscale user on
+      request.state.
+    - Every kind of app: participant tokens (participant.py). Client-sent
+      Participant-* headers are removed and, when CADDYTAIL_PARTICIPANT_KEYS
+      is set, a verified token's claims are added in their place. A generic
+      WSGI/ASGI callable is wrapped, so use the returned app.
+
+    Used both by the in-process dev server and by the caddytail.wsgi shim,
+    so an external server (gunicorn) gets the same behaviour after it
+    re-imports the app in its worker processes.
+    """
+    if framework is None:
+        framework = _detect_framework(app)
+
+    from . import participant
+
+    if framework == "flask":
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_host=1)
+        # Participant-* headers are caddytail's to set (see participant.py).
+        app.wsgi_app = participant.WSGIMiddleware(app.wsgi_app)
+    elif framework == "fastapi":
+        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.requests import Request
+
+        class TailscaleUserMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Request, call_next):
+                request.state.tailscale_user = _extract_user_from_headers(
+                    dict(request.headers)
+                )
+                return await call_next(request)
+
+        app.add_middleware(TailscaleUserMiddleware)
+        app.add_middleware(participant.ASGIMiddleware)
+    elif framework == "asgi":
+        return participant.ASGIMiddleware(app)
+    elif framework == "wsgi":
+        return participant.WSGIMiddleware(app)
+    return app
+
+
 # ---------------------------------------------------------------------------
 # CaddyTail class — for programmatic use
 # ---------------------------------------------------------------------------
@@ -456,6 +524,10 @@ class CaddyTail:
         hostname: Tailscale hostname (e.g., "myapp")
         static: Extra static paths as a dict or list of StaticPath
         debug: Enable Caddy debug mode
+        service: Also advertise the app as this Tailscale Service
+                 (e.g. "svc:research"). Run the same app with the same service
+                 on several hosts for failover. The node must be tagged.
+        tags: ACL tags to advertise for the node (e.g. ["tag:research"])
         **kwargs: Override auto-detected settings (tailnet, caddy_path,
                   app_port, caddy_http_port, caddy_admin_port, state_dir)
     """
@@ -470,6 +542,12 @@ class CaddyTail:
         funnel: bool = False,
         tailnet_listener: bool = False,
         exposures: Optional[list[Exposure]] = None,
+        server: str = "dev",
+        workers: int = 1,
+        threads: int = 8,
+        app_ref: Optional[str] = None,
+        service: Optional[str] = None,
+        tags: Optional[list[str]] = None,
         tailnet: Optional[str] = None,
         caddy_path: Optional[Union[str, Path]] = None,
         app_port: Optional[int] = None,
@@ -479,6 +557,17 @@ class CaddyTail:
     ):
         self.app = app
         self.hostname = hostname
+
+        # App server: "dev" runs the app in-process (Werkzeug/wsgiref/uvicorn);
+        # "gunicorn" spawns a hardened gunicorn subprocess bound to app_port.
+        if server not in ("dev", "gunicorn"):
+            raise ValueError(f"invalid server {server!r}; expected 'dev' or 'gunicorn'")
+        self.server = server
+        self.workers = workers
+        self.threads = threads
+        # Import string (module:variable) needed to launch an external server,
+        # which re-imports the app in its own worker processes.
+        self.app_ref = app_ref
 
         # Resolve which listeners to create. Priority:
         #   explicit exposures= > funnel/tailnet_listener flags >
@@ -519,6 +608,8 @@ class CaddyTail:
 
         self.state_dir = Path(state_dir).resolve() if state_dir else None
         self.debug = debug
+        self.service = normalize_service_name(service) if service else None
+        self.tags = list(tags) if tags else []
 
         # Normalize static paths
         self.static_paths: list[StaticPath] = []
@@ -533,36 +624,22 @@ class CaddyTail:
         self.static_paths.extend(get_registered_statics(app))
 
         self._caddy_process: Optional[subprocess.Popen] = None
+        self._app_process: Optional[subprocess.Popen] = None
         self._framework = _detect_framework(app)
 
-        self._setup_middleware()
+        # For the dev server we mutate the in-process app object. For an
+        # external server the worker processes re-import the app, so the
+        # middleware is re-applied there by the caddytail.wsgi shim instead.
+        if self.server == "dev":
+            self._setup_middleware()
 
     @property
     def admin_url(self) -> str:
         return f"http://localhost:{self.caddy_admin_port}"
 
     def _setup_middleware(self) -> None:
-        if self._framework == "flask":
-            self._setup_flask_middleware()
-        elif self._framework == "fastapi":
-            self._setup_fastapi_middleware()
-        # No middleware needed for generic wsgi/asgi apps
-
-    def _setup_flask_middleware(self) -> None:
-        from werkzeug.middleware.proxy_fix import ProxyFix
-        self.app.wsgi_app = ProxyFix(self.app.wsgi_app, x_host=1)
-
-    def _setup_fastapi_middleware(self) -> None:
-        from starlette.middleware.base import BaseHTTPMiddleware
-        from starlette.requests import Request
-
-        class TailscaleUserMiddleware(BaseHTTPMiddleware):
-            async def dispatch(self, request: Request, call_next):
-                user = _extract_user_from_headers(dict(request.headers))
-                request.state.tailscale_user = user
-                return await call_next(request)
-
-        self.app.add_middleware(TailscaleUserMiddleware)
+        # A generic WSGI/ASGI callable comes back wrapped; registrations were read above.
+        self.app = apply_middleware(self.app, self._framework)
 
     def _exposure_url(self, exposure: Exposure) -> str:
         host = exposure.hostname or self.hostname
@@ -584,6 +661,12 @@ class CaddyTail:
             self.exposures[0],
         )
         return self._exposure_url(primary)
+
+    @property
+    def service_url(self) -> Optional[str]:
+        if not self.service:
+            return None
+        return f"https://{self.service}.{self.tailnet}.ts.net"
 
     def _build_subroutes(self, exposure: Exposure) -> list[dict]:
         """Static-file routes plus the terminal reverse_proxy for one exposure.
@@ -608,6 +691,8 @@ class CaddyTail:
             }
             if sp.browse:
                 handler["browse"] = {}
+            if sp.index:
+                handler["index_names"] = sp.index
 
             routes.append({
                 "match": match,
@@ -618,6 +703,7 @@ class CaddyTail:
             request_headers = {
                 "set": {
                     HEADER_USER_LOGIN: ["{http.auth.user.tailscale_login}"],
+                    HEADER_USER_EMAIL: ["{http.auth.user.tailscale_user}"],
                     HEADER_USER_NAME: ["{http.auth.user.tailscale_name}"],
                     HEADER_USER_PROFILE_PIC: ["{http.auth.user.tailscale_profile_picture}"],
                     HEADER_NODE: ["{http.auth.user.tailscale_node}"],
@@ -626,7 +712,7 @@ class CaddyTail:
             }
         else:
             request_headers = {
-                "delete": [HEADER_USER_NAME, HEADER_USER_LOGIN,
+                "delete": [HEADER_USER_NAME, HEADER_USER_LOGIN, HEADER_USER_EMAIL,
                            HEADER_USER_PROFILE_PIC, HEADER_NODE, HEADER_TAGS],
             }
 
@@ -640,11 +726,8 @@ class CaddyTail:
 
         return routes
 
-    def _build_server(self, exposure: Exposure) -> dict:
-        """Build one Caddy HTTP server for a single exposure."""
-        host = exposure.hostname or self.hostname
-        fqdn = f"{host}.{self.tailnet}.ts.net"
-
+    def _build_handlers(self, exposure: Exposure) -> list[dict]:
+        """The handler chain for one exposure: auth (if any), encode, routes."""
         handlers: list[dict] = []
         if exposure.auth:
             handlers.append({
@@ -660,6 +743,14 @@ class CaddyTail:
             "handler": "subroute",
             "routes": self._build_subroutes(exposure),
         })
+        return handlers
+
+    def _build_server(self, exposure: Exposure) -> dict:
+        """Build one Caddy HTTP server for a single exposure."""
+        host = exposure.hostname or self.hostname
+        fqdn = f"{host}.{self.tailnet}.ts.net"
+
+        handlers = self._build_handlers(exposure)
 
         server: dict[str, Any] = {
             "listen": [f"{exposure.network}/{host}:{exposure.port}"],
@@ -695,6 +786,10 @@ class CaddyTail:
         # All distinct nodes referenced by the exposures.
         node_hosts = sorted({e.hostname or self.hostname for e in self.exposures})
 
+        node_config: dict[str, Any] = {}
+        if self.tags:
+            node_config["tags"] = self.tags
+
         config: dict[str, Any] = {
             "admin": {
                 "listen": f"localhost:{self.caddy_admin_port}",
@@ -707,7 +802,12 @@ class CaddyTail:
                 },
                 "tailscale": {
                     **({"state_dir": str(self.state_dir)} if self.state_dir else {}),
-                    "nodes": {host: {} for host in node_hosts},
+                    # Tags belong to the app's own node (the one a Service is
+                    # advertised from).
+                    "nodes": {
+                        host: (node_config if host == self.hostname else {})
+                        for host in node_hosts
+                    },
                 },
             },
         }
@@ -720,6 +820,20 @@ class CaddyTail:
                         "get_certificate": [{"via": "tailscale"}],
                     }],
                 },
+            }
+
+        if self.service:
+            # Tailscale Service listener: tailscaled terminates TLS for the
+            # service FQDN and forwards plain HTTP/1.1 (with a PROXY header
+            # carrying the client address, so tailscale auth still works).
+            # Automatic HTTPS must be off, otherwise Caddy would try to speak
+            # TLS on this :443 listener. It is an authenticated tailnet
+            # surface, so it gets the same handlers as a tailnet exposure.
+            config["apps"]["http"]["servers"]["tailscale_svc"] = {
+                "listen": [f"tailscale+svc/{self.service}@{self.hostname}:443"],
+                "protocols": ["h1"],
+                "automatic_https": {"disable": True},
+                "routes": [{"handle": self._build_handlers(Exposure(mode="tailnet"))}],
             }
 
         if self.debug:
@@ -765,6 +879,9 @@ class CaddyTail:
         for exposure, url in self.urls:
             label = "public" if exposure.is_funnel else "tailnet"
             print(f"  [{label}] {url}")
+        if self.service_url:
+            print(f"  [service] {self.service_url} (svc:{self.service}; "
+                  "needs host approval in the Tailscale admin console)")
 
     def load_config(self) -> None:
         config = self.generate_config()
@@ -814,6 +931,8 @@ class CaddyTail:
             ]
             if self.state_dir:
                 cmd.extend(["--state-dir", str(self.state_dir / host)])
+            if self.tags and host == self.hostname:
+                cmd.extend(["--tags", ",".join(self.tags)])
             rc = subprocess.call(cmd)
             if rc != 0:
                 raise RuntimeError(
@@ -877,6 +996,69 @@ class CaddyTail:
                 self._caddy_process.kill()
             self._caddy_process = None
 
+    def _gunicorn_command(self) -> list[str]:
+        """Build the gunicorn command line for the current framework.
+
+        WSGI apps use the ``gthread`` worker (one process, N threads) — a
+        drop-in for the threaded dev server that keeps in-memory state
+        consistent. ASGI apps use the uvicorn worker class instead.
+        """
+        if not self.app_ref:
+            raise RuntimeError(
+                "server='gunicorn' requires app_ref (the 'module:variable' "
+                "import string); it is set automatically by `caddytail run`"
+            )
+
+        import importlib.util
+        if importlib.util.find_spec("gunicorn") is None:
+            raise RuntimeError(
+                "gunicorn is not installed. Install it with: "
+                "pip install 'caddytail[gunicorn]'"
+            )
+
+        cmd = [
+            sys.executable, "-m", "gunicorn",
+            "--bind", f"127.0.0.1:{self.app_port}",
+            "--workers", str(self.workers),
+        ]
+        if self._framework in ("fastapi", "asgi"):
+            if importlib.util.find_spec("uvicorn") is None:
+                raise RuntimeError(
+                    "serving an ASGI app under gunicorn needs uvicorn. Install "
+                    "it with: pip install 'caddytail[gunicorn]'"
+                )
+            cmd += ["--worker-class", "uvicorn.workers.UvicornWorker"]
+        else:
+            cmd += ["--worker-class", "gthread", "--threads", str(self.threads)]
+        cmd.append("caddytail.wsgi:application")
+        return cmd
+
+    def _start_app_server(self) -> subprocess.Popen:
+        """Spawn gunicorn as a managed subprocess bound to app_port."""
+        if self._app_process is not None:
+            raise RuntimeError("App server is already running")
+
+        cmd = self._gunicorn_command()
+        env = os.environ.copy()
+        # The caddytail.wsgi shim reads this to import + wrap the real app.
+        env["CADDYTAIL_APP"] = self.app_ref
+
+        print(f"Starting app server: {' '.join(cmd)}")
+        self._app_process = subprocess.Popen(
+            cmd, env=env, stdout=sys.stdout, stderr=sys.stderr,
+        )
+        return self._app_process
+
+    def _stop_app_server(self) -> None:
+        if self._app_process is not None:
+            # SIGTERM triggers gunicorn's graceful worker shutdown.
+            self._app_process.terminate()
+            try:
+                self._app_process.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                self._app_process.kill()
+            self._app_process = None
+
     def run(
         self,
         host: str = "127.0.0.1",
@@ -885,6 +1067,7 @@ class CaddyTail:
     ) -> None:
         def signal_handler(signum, frame):
             print("\nShutting down...")
+            self._stop_app_server()
             self.stop_caddy()
             sys.exit(0)
 
@@ -895,7 +1078,10 @@ class CaddyTail:
             self.start_caddy()
 
         try:
-            if self._framework == "flask":
+            if self.server == "gunicorn":
+                proc = self._start_app_server()
+                proc.wait()
+            elif self._framework == "flask":
                 self.app.run(host=host, port=self.app_port, **kwargs)
             elif self._framework == "wsgi":
                 from wsgiref.simple_server import make_server
@@ -906,6 +1092,7 @@ class CaddyTail:
                 import uvicorn
                 uvicorn.run(self.app, host=host, port=self.app_port, **kwargs)
         finally:
+            self._stop_app_server()
             self.stop_caddy()
 
     def run_async(

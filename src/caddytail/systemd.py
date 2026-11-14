@@ -105,10 +105,13 @@ def install_service(
     *,
     working_directory: Optional[str] = None,
     environment: Optional[dict[str, str]] = None,
+    service: Optional[str] = None,
+    tags: Optional[list[str]] = None,
     enable: bool = True,
     start: bool = True,
     tailscale_url: Optional[str] = None,
     extra_args: Optional[list[str]] = None,
+    service_url: Optional[str] = None,
 ) -> Path:
     """
     Install a caddytail app as a systemd user service.
@@ -120,6 +123,8 @@ def install_service(
         app_ref: App reference in module:variable form (e.g. "app:app").
         working_directory: Working directory for the service (default: cwd).
         environment: Extra environment variables.
+        service: Tailscale Service to advertise (e.g. "svc:research").
+        tags: ACL tags to advertise for the node.
         enable: Enable the service so it starts on login.
         start: Start the service immediately.
 
@@ -135,6 +140,10 @@ def install_service(
     exec_start = f"{caddytail_path} run {hostname} {app_ref}"
     if extra_args:
         exec_start += " " + " ".join(extra_args)
+    if service:
+        exec_start += f" --service {service}"
+    for tag in tags or []:
+        exec_start += f" --tag {tag}"
 
     env_lines = ""
     if environment:
@@ -177,6 +186,8 @@ def install_service(
     if tailscale_url:
         print()
         print(f"  URL: {tailscale_url}")
+    if service_url:
+        print(f"  Service URL: {service_url} (approve this host in the Tailscale admin console)")
 
     print()
     print("Hint: to keep the service running after you log out, run:")
